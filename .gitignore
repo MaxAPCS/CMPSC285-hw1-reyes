@@ -1,0 +1,8 @@
+# don't lock dependency versions
+Cargo.lock
+
+# rust build files
+target/
+
+# program output files
+renders/
