@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 bytemuck = { version = "1.25", features = ["must_cast", "derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
+nalgebra = "0.35"
 
 [build-dependencies]
 # build.rs compiles the C++ scene files with it.

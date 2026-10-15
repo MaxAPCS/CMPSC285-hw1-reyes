@@ -35,6 +35,8 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::shaders;
+
 /* ------------------------------------------------------------------ types */
 
 pub type RtVoid = ();
@@ -42,14 +44,17 @@ pub type RtFloat = f32;
 pub type RtInt = i32;
 pub type RtToken = *const c_char;
 pub type RtPointer = *mut c_void;
-pub type RtColor = [RtFloat; 3];
-pub type RtPoint = [RtFloat; 3];
-pub type RtVector = [RtFloat; 3];
-pub type RtNormal = [RtFloat; 3];
-pub type RtMatrix = [[RtFloat; 4]; 4];
+pub type RtColor = nalgebra::Vector3<RtFloat>; // compatible with [RtFloat; 3]
+pub type RtPoint = nalgebra::Point3<RtFloat>; // compatible with [RtFloat; 3]
+pub type RtVector = nalgebra::Vector3<RtFloat>; // compatible with [RtFloat; 3]
+pub type RtNormal = nalgebra::UnitVector3<RtFloat>; // compatible with [RtFloat; 3]
+pub type RtMatrix = nalgebra::Matrix4<RtFloat>; // compatible with [[RtFloat; 4]; 4]
 
-pub const RI_PERSPECTIVE: &str = "perspective";
-pub const RI_ORTHOGRAPHIC: &str = "orthographic";
+#[derive(Clone, Copy)]
+enum RtProjection {
+    Orthographic,
+    Perspective,
+}
 
 /// What a shader sees at one grid vertex (Ri.h's RtShaderContext, same
 /// layout). The renderer fills in the inputs; a displacement shader moves
@@ -76,6 +81,32 @@ pub struct RtShaderContext {
 pub type RtShaderFn = Option<unsafe extern "C" fn(*mut RtShaderContext)>;
 
 /* --------------------------------------------------------- renderer state */
+#[derive(Clone, Copy)]
+struct State {
+    color: RtColor,
+    opacity: RtColor,
+    shader: RtShaderFn,
+    projection: RtProjection,
+}
+
+const WHITE: RtColor = nalgebra::Vector3::new(1., 1., 1.);
+impl State {
+    const fn default() -> Self {
+        Self {
+            color: WHITE,
+            opacity: WHITE,
+            shader: Some(shaders::STANDARD),
+            projection: RtProjection::Orthographic,
+        }
+    }
+}
+impl Default for State {
+    fn default() -> Self {
+        Self::default()
+    }
+}
+
+static STATE: Mutex<State> = Mutex::new(State::default());
 
 /// What the scene has asked for so far. The finished renderer keeps much
 /// more here: the current transformation, its stack, the color, opacity and
@@ -88,15 +119,25 @@ struct Options {
     display: String,
     depth_display: bool, /* RiDisplay(name, "zfile", "z") */
 }
+impl Options {
+    const fn default() -> Self {
+        Self {
+            xres: 640,
+            yres: 480,
+            xsamples: 2,
+            ysamples: 2,
+            display: String::new(),
+            depth_display: false,
+        }
+    }
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self::default()
+    }
+}
 
-static OPTIONS: Mutex<Options> = Mutex::new(Options {
-    xres: 640,
-    yres: 480,
-    xsamples: 2,
-    ysamples: 2,
-    display: String::new(),
-    depth_display: false,
-});
+static OPTIONS: Mutex<Options> = Mutex::new(Options::default());
 
 /// A C string argument as a Rust &str ("" for a null pointer).
 unsafe fn token(s: *const c_char) -> &'static str {
@@ -116,7 +157,12 @@ unsafe fn token(s: *const c_char) -> &'static str {
 /// RiOpacity). RiEnd ends the session (free textures and buffers here).
 /// The name is always RI_NULL.
 #[unsafe(no_mangle)]
-pub extern "C" fn RiBegin(_name: RtToken) {}
+pub extern "C" fn RiBegin(_name: RtToken) {
+    let mut s = STATE.lock().unwrap();
+    *s = State::default();
+    let mut o = OPTIONS.lock().unwrap();
+    *o = Options::default();
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiEnd() {}
@@ -151,13 +197,25 @@ pub unsafe extern "C" fn RiDisplay(name: *const c_char, type_: RtToken, mode: Rt
     }
 }
 
+static FRAME_STATE: Mutex<Option<State>> = Mutex::new(None);
 /// RiFrameBegin/End bracket one frame of an animation: save the graphics
 /// state at Begin and restore it at End, so that each frame starts afresh.
 #[unsafe(no_mangle)]
-pub extern "C" fn RiFrameBegin(_frame: RtInt) {}
+pub extern "C" fn RiFrameBegin(_frame: RtInt) {
+    let s = STATE.lock().unwrap();
+    let mut fs = FRAME_STATE.lock().unwrap();
+    *fs = Some(s.clone());
+}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn RiFrameEnd() {}
+pub extern "C" fn RiFrameEnd() {
+    let mut s = STATE.lock().unwrap();
+    let fs = FRAME_STATE
+        .lock()
+        .unwrap()
+        .expect("RiFrameEnd() called before RiFrameBegin()");
+    *s = fs;
+}
 
 /// RiWorldBegin: the transformation built so far is the camera transform
 /// (world to camera); from here on transformations place objects. Set up

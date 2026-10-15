@@ -102,9 +102,6 @@ fn make_render_folders() {
 }
 
 fn main() {
-    // The scenes look for textures/ and models/ and write into renders/
-    // relative to the kit root, the folder above this Cargo project. Go
-    // there, so that `cargo run` works from rust/ or from the kit root.
     let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
 
     if !assets.join("scenes").is_dir() {
