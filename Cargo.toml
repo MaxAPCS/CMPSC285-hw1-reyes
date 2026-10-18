@@ -5,14 +5,11 @@ edition = "2024"
 description = "ECE/CS 285 HW1: a REYES renderer in Rust, driven by the C++ scene files"
 build = "build.rs"
 
-[[bin]]
-name = "reyes"
-path = "src/main.rs"
-
 [dependencies]
-bytemuck = { version = "1.25", features = ["must_cast", "derive"] }
+ndarray = { version = "0.17", features = ["rayon"] }
+bytemuck = "1.25"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
-nalgebra = "0.35"
+nalgebra = { version = "0.35", features = ["bytemuck"] }
 
 [build-dependencies]
 # build.rs compiles the C++ scene files with it.

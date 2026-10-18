@@ -28,18 +28,24 @@
 //! except through that interface.
 
 #![allow(non_snake_case)] // the Ri names and the context's fields are RenderMan's
-#![allow(dead_code)] // the parts of the interface the stub does not use yet
 
+use std::collections::BinaryHeap;
 use std::ffi::{CStr, c_char, c_void};
 use std::io::Write;
+use std::mem::MaybeUninit;
 use std::path::Path;
-use std::sync::Mutex;
+use std::ptr;
+use std::sync::{Arc, Mutex};
+use std::{debug_assert_matches, f32};
+
+use image::{DynamicImage, GenericImageView, Pixel};
+use nalgebra::{Matrix4, Orthographic3, Perspective3, Projective3, UnitVector3, Vector3, matrix};
+use ndarray::{Array1, Array2, Array3, Axis, Zip, s};
 
 use crate::shaders;
 
 /* ------------------------------------------------------------------ types */
 
-pub type RtVoid = ();
 pub type RtFloat = f32;
 pub type RtInt = i32;
 pub type RtToken = *const c_char;
@@ -48,13 +54,7 @@ pub type RtColor = nalgebra::Vector3<RtFloat>; // compatible with [RtFloat; 3]
 pub type RtPoint = nalgebra::Point3<RtFloat>; // compatible with [RtFloat; 3]
 pub type RtVector = nalgebra::Vector3<RtFloat>; // compatible with [RtFloat; 3]
 pub type RtNormal = nalgebra::UnitVector3<RtFloat>; // compatible with [RtFloat; 3]
-pub type RtMatrix = nalgebra::Matrix4<RtFloat>; // compatible with [[RtFloat; 4]; 4]
-
-#[derive(Clone, Copy)]
-enum RtProjection {
-    Orthographic,
-    Perspective,
-}
+pub type RtMatrix = nalgebra::Projective3<RtFloat>; // compatible with [[RtFloat; 4]; 4]
 
 /// What a shader sees at one grid vertex (Ri.h's RtShaderContext, same
 /// layout). The renderer fills in the inputs; a displacement shader moves
@@ -80,46 +80,69 @@ pub struct RtShaderContext {
 /// (RiSurface(NULL, NULL, 0) means STANDARD).
 pub type RtShaderFn = Option<unsafe extern "C" fn(*mut RtShaderContext)>;
 
-/* --------------------------------------------------------- renderer state */
-#[derive(Clone, Copy)]
-struct State {
-    color: RtColor,
-    opacity: RtColor,
-    shader: RtShaderFn,
-    projection: RtProjection,
+/// A C string argument as a Rust &str ("" for a null pointer).
+#[inline]
+unsafe fn read_token(s: RtToken) -> &'static str {
+    if s.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(s) }.to_str().unwrap_or("")
+    }
 }
 
-const WHITE: RtColor = nalgebra::Vector3::new(1., 1., 1.);
-impl State {
+/* --------------------------------------------------------- renderer state */
+
+/// Running state, changes model-to-model
+#[derive(Clone)]
+struct ModelState {
+    transform: Vec<RtMatrix>,
+    color: RtColor,
+    opacity: RtColor,
+    surface: RtShaderFn,
+    surface_params: Option<Arc<[u8]>>,
+    displace: RtShaderFn,
+    displace_params: Option<Arc<[u8]>>,
+
+    projection: Option<Projective3<RtFloat>>,
+    textures: [Option<DynamicImage>; 8],
+}
+
+const WHITE: RtColor = RtColor::new(1., 1., 1.);
+impl ModelState {
     const fn default() -> Self {
         Self {
+            transform: Vec::new(),
             color: WHITE,
             opacity: WHITE,
-            shader: Some(shaders::STANDARD),
-            projection: RtProjection::Orthographic,
+            surface: None,
+            surface_params: None,
+            displace: None,
+            displace_params: None,
+            projection: None,
+            textures: [const { None }; 8],
         }
     }
 }
-impl Default for State {
+impl Default for ModelState {
     fn default() -> Self {
         Self::default()
     }
 }
 
-static STATE: Mutex<State> = Mutex::new(State::default());
-
 /// What the scene has asked for so far. The finished renderer keeps much
 /// more here: the current transformation, its stack, the color, opacity and
 /// bound shaders, the projection, the sample buffer ... (handout, Section 2).
-struct Options {
-    xres: i32,
-    yres: i32,
-    xsamples: i32,
-    ysamples: i32,
+struct RenderState {
+    xres: usize,
+    yres: usize,
+    xsamples: usize,
+    ysamples: usize,
     display: String,
     depth_display: bool, /* RiDisplay(name, "zfile", "z") */
+    depth_buffer: Option<Array2<f32>>,
+    sample_buffer: Option<Array2<BinaryHeap<Sample>>>,
 }
-impl Options {
+impl RenderState {
     const fn default() -> Self {
         Self {
             xres: 640,
@@ -128,25 +151,103 @@ impl Options {
             ysamples: 2,
             display: String::new(),
             depth_display: false,
+            depth_buffer: None,
+            sample_buffer: None,
         }
     }
 }
-impl Default for Options {
+impl Default for RenderState {
     fn default() -> Self {
         Self::default()
     }
 }
 
-static OPTIONS: Mutex<Options> = Mutex::new(Options::default());
-
-/// A C string argument as a Rust &str ("" for a null pointer).
-unsafe fn token(s: *const c_char) -> &'static str {
-    if s.is_null() {
-        ""
-    } else {
-        unsafe { CStr::from_ptr(s) }.to_str().unwrap_or("")
+struct MicroPolygon {
+    pub P: RtPoint,  /* point in world space */
+    pub Po: RtPoint, /* object space */
+    pub N: RtVector, /* area-scaled normal, recomputed after displacement */
+    pub u: RtFloat,  /* surface parameters in [0,1], or a mesh's st */
+    pub v: RtFloat,
+    pub Cs: RtColor, /* current RiColor and RiOpacity */
+    pub Os: RtColor,
+}
+impl MicroPolygon {
+    fn surface(&mut self, shader: RtShaderFn, params: Option<Arc<[u8]>>) {
+        let params = if let Some(params) = params {
+            params.as_ptr()
+        } else {
+            ptr::null()
+        } as _;
+        let mut ctx = RtShaderContext {
+            P: self.P,
+            Po: self.Po,
+            N: RtNormal::new_normalize(self.N),
+            u: self.u,
+            v: self.v,
+            Cs: self.Cs,
+            Os: self.Os,
+            params,
+            Ci: RtColor::zeros(),
+            Oi: RtColor::zeros(),
+        };
+        unsafe { shader.unwrap_or(shaders::STANDARD)(ptr::from_mut(&mut ctx)) }
+        self.Cs = ctx.Ci;
+        self.Os = ctx.Oi;
+    }
+    fn displace(&mut self, shader: RtShaderFn, params: Option<Arc<[u8]>>) {
+        let Some(shader) = shader else { return };
+        let params = if let Some(params) = params {
+            params.as_ptr()
+        } else {
+            ptr::null()
+        } as _;
+        let mut ctx = RtShaderContext {
+            P: self.P,
+            Po: self.Po,
+            N: RtNormal::new_normalize(self.N),
+            u: self.u,
+            v: self.v,
+            Cs: self.Cs,
+            Os: self.Os,
+            params,
+            Ci: RtColor::zeros(),
+            Oi: RtColor::zeros(),
+        };
+        unsafe { shader(ptr::from_mut(&mut ctx)) }
+        self.P = ctx.P;
+        // must recompute normals later
     }
 }
+
+#[derive(Clone)] // exclusively so populating the Array2 works
+struct Sample {
+    z: RtFloat,
+    Cs: RtColor,
+    Os: RtColor,
+}
+impl PartialEq for Sample {
+    fn eq(&self, other: &Self) -> bool {
+        self.z == other.z
+    }
+}
+impl Eq for Sample {}
+impl PartialOrd for Sample {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.z.partial_cmp(&other.z)
+    }
+}
+impl Ord for Sample {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.z.total_cmp(&other.z)
+    }
+}
+
+const IDENTITY: RtMatrix =
+    RtMatrix::from_matrix_unchecked(matrix! [1.,0.,0.,0.;0.,1.,0.,0.;0.,0.,1.,0.;0.,0.,0.,1.]);
+
+static MSTATE: Mutex<ModelState> = Mutex::new(ModelState::default());
+static RSTATE: Mutex<RenderState> = Mutex::new(RenderState::default());
+static FRAME_MSTATE: Mutex<Option<ModelState>> = Mutex::new(None);
 
 /* ---------------------------------------------------------- graphics state */
 
@@ -158,10 +259,10 @@ unsafe fn token(s: *const c_char) -> &'static str {
 /// The name is always RI_NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn RiBegin(_name: RtToken) {
-    let mut s = STATE.lock().unwrap();
-    *s = State::default();
-    let mut o = OPTIONS.lock().unwrap();
-    *o = Options::default();
+    let mut rstate = RSTATE.lock().unwrap();
+    *rstate = RenderState::default();
+    let mut mstate = MSTATE.lock().unwrap();
+    *mstate = ModelState::default();
 }
 
 #[unsafe(no_mangle)]
@@ -172,17 +273,17 @@ pub extern "C" fn RiEnd() {}
 /// view spans the shorter side (Section 2).
 #[unsafe(no_mangle)]
 pub extern "C" fn RiFormat(xres: RtInt, yres: RtInt) {
-    let mut o = OPTIONS.lock().unwrap();
-    o.xres = xres;
-    o.yres = yres;
+    let mut rstate = RSTATE.lock().unwrap();
+    rstate.xres = xres as usize;
+    rstate.yres = yres as usize;
 }
 
 /// xsamples x ysamples jittered samples per pixel (Section 4).
 #[unsafe(no_mangle)]
 pub extern "C" fn RiPixelSamples(xsamples: RtInt, ysamples: RtInt) {
-    let mut o = OPTIONS.lock().unwrap();
-    o.xsamples = xsamples.max(1);
-    o.ysamples = ysamples.max(1);
+    let mut rstate = RSTATE.lock().unwrap();
+    rstate.xsamples = xsamples.max(1) as usize;
+    rstate.ysamples = ysamples.max(1) as usize;
 }
 
 /// The output file, written into renders/ by RiWorldEnd. RiDisplay(name, "",
@@ -190,52 +291,112 @@ pub extern "C" fn RiPixelSamples(xsamples: RtInt, ysamples: RtInt) {
 /// image instead (Section 4, "Depth output").
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn RiDisplay(name: *const c_char, type_: RtToken, mode: RtToken) {
-    let mut o = OPTIONS.lock().unwrap();
+    let mut rstate = RSTATE.lock().unwrap();
     unsafe {
-        o.display = token(name).to_string();
-        o.depth_display = token(type_) == "zfile" || token(mode) == "z";
+        rstate.display = read_token(name).to_string();
+        rstate.depth_display = read_token(type_) == "zfile" || read_token(mode) == "z";
     }
 }
 
-static FRAME_STATE: Mutex<Option<State>> = Mutex::new(None);
 /// RiFrameBegin/End bracket one frame of an animation: save the graphics
 /// state at Begin and restore it at End, so that each frame starts afresh.
 #[unsafe(no_mangle)]
 pub extern "C" fn RiFrameBegin(_frame: RtInt) {
-    let s = STATE.lock().unwrap();
-    let mut fs = FRAME_STATE.lock().unwrap();
-    *fs = Some(s.clone());
+    let mstate = MSTATE.lock().unwrap();
+    let mut fmstate = FRAME_MSTATE.lock().unwrap();
+
+    *fmstate = Some(mstate.clone());
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiFrameEnd() {
-    let mut s = STATE.lock().unwrap();
-    let fs = FRAME_STATE
+    let mut mstate = MSTATE.lock().unwrap();
+    let fmstate = FRAME_MSTATE
         .lock()
         .unwrap()
-        .expect("RiFrameEnd() called before RiFrameBegin()");
-    *s = fs;
+        .take()
+        .expect("RiFrameEnd called before RiFrameBegin");
+    *mstate = fmstate;
 }
 
 /// RiWorldBegin: the transformation built so far is the camera transform
 /// (world to camera); from here on transformations place objects. Set up
-/// the sample buffer. RiWorldEnd: all primitives have been drawn, so filter
-/// the samples into pixels and write the image (Sections 2 and 4).
+/// the sample buffer.
 #[unsafe(no_mangle)]
-pub extern "C" fn RiWorldBegin() {}
+pub extern "C" fn RiWorldBegin() {
+    let mut mstate = MSTATE.lock().unwrap();
+    let tf = mstate
+        .transform
+        .pop()
+        .expect("RiWorldBegin called before RiProjection");
+    assert!(mstate.projection.is_none());
+    mstate.projection = Some(tf);
+    mstate.transform = vec![IDENTITY];
 
+    let mut rstate = RSTATE.lock().unwrap();
+    rstate.sample_buffer = Some(Array2::from_elem(
+        (rstate.yres * rstate.ysamples, rstate.xres * rstate.xsamples),
+        BinaryHeap::new(),
+    ));
+    rstate.depth_buffer = Some(Array2::from_elem((rstate.yres, rstate.xres), 0.));
+}
+
+/// RiWorldEnd: all primitives have been drawn, so filter the samples into pixels and write the image (Sections 2 and 4).
 #[unsafe(no_mangle)]
 pub extern "C" fn RiWorldEnd() {
-    // TODO: your pixels. For now, a black, fully transparent image (or an
-    // empty depth image, +infinity everywhere).
-    let (w, h, depth) = {
-        let o = OPTIONS.lock().unwrap();
-        (o.xres as usize, o.yres as usize, o.depth_display)
-    };
-    if depth {
-        write_depth(&vec![f32::INFINITY; w * h]);
+    let mut rstate = RSTATE.lock().unwrap();
+    if rstate.depth_display {
+        let dbuf = rstate
+            .depth_buffer
+            .take()
+            .expect("RiWorldEnd called before RiWorldBegin");
+        write_depth(&dbuf, &rstate.display);
     } else {
-        write_image(&vec![0.0f32; w * h * 4]);
+        let mut fbuf = Array3::<u8>::uninit((rstate.yres, rstate.xres, 4));
+        {
+            let mut sbuf = rstate
+                .sample_buffer
+                .take()
+                .expect("RiWorldEnd caleld before RiWorldBegin");
+            sbuf.par_map_inplace(|s| {
+                if s.is_empty() {
+                    return;
+                }
+
+                let mut opacity = RtColor::zeros();
+                let mut color = RtColor::zeros();
+                while let Some(sample) = s.pop() {
+                    opacity += sample.Os;
+                    color += sample.Cs.component_mul(&sample.Os);
+                    if opacity == WHITE {
+                        s.clear();
+                        break;
+                    }
+                }
+                s.push(Sample {
+                    z: 0.,
+                    Cs: color,
+                    Os: opacity,
+                });
+            });
+            Zip::from(sbuf.exact_chunks_mut((rstate.ysamples, rstate.xsamples)))
+                .and(fbuf.lanes_mut(Axis(2)))
+                .par_for_each(|samples, mut lane| {
+                    let mut color = Array1::from_elem(4, 0.);
+                    for s in samples {
+                        if let Some(s) = s.pop() {
+                            color[0] += s.Cs.x;
+                            color[1] += s.Cs.y;
+                            color[2] += s.Cs.z;
+                            color[3] += s.Os.sum();
+                        }
+                    }
+                    color /= (rstate.ysamples * rstate.xsamples) as RtFloat;
+                    color[3] /= 3.; // average of 3 opacity colors
+                    lane.assign((*color.mapv(to8).mapv(MaybeUninit::new)).into());
+                });
+        } // drop sbuf
+        write_image(unsafe { fbuf.assume_init() }, &rstate.display).unwrap();
     }
 }
 
@@ -245,8 +406,24 @@ pub extern "C" fn RiWorldEnd() {
 /// also resets the current transformation to the identity: the camera
 /// transform is built after it (Section 2). value points at an RtFloat.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn RiProjection(name: RtToken, token: RtToken, value: RtPointer) {
-    let (_name, _token, _value) = (name, token, value);
+pub unsafe extern "C" fn RiProjection(name: RtToken, _token: RtToken, value: RtPointer) {
+    let name = unsafe { read_token(name) };
+
+    let mut mstate = MSTATE.lock().unwrap();
+    let rstate = RSTATE.lock().unwrap();
+    let (xr, yr) = (rstate.xres as f32, rstate.yres as f32);
+    mstate.transform = vec![match name {
+        "perspective" => Perspective3::new(
+            yr / xr,
+            unsafe { *(value as *const _ as *const _) },
+            0.1,
+            100.,
+        )
+        .to_projective(),
+        "orthographic" => Orthographic3::new(-xr, xr, -yr, yr, 0.1, 100.).to_projective(),
+        _ => panic!("RiProjection called with invalid name"),
+    }];
+    mstate.projection = None;
 }
 
 /* ----------------------------------------------------------- transformations */
@@ -258,30 +435,60 @@ pub unsafe extern "C" fn RiProjection(name: RtToken, token: RtToken, value: RtPo
 /// in RenderMan's row-vector form (p' = p M, translation in the bottom
 /// row); in C an array argument decays to a pointer, so it arrives as a
 /// pointer to four rows of four floats. Angles are degrees (Section 2).
-#[unsafe(no_mangle)]
-pub extern "C" fn RiTransformBegin() {}
 
+/// Transform push
 #[unsafe(no_mangle)]
-pub extern "C" fn RiTransformEnd() {}
+pub extern "C" fn RiTransformBegin() {
+    let tstk = &mut MSTATE.lock().unwrap().transform;
+    let t = tstk.last().cloned().unwrap_or(IDENTITY);
+    tstk.push(t);
+}
+
+/// Transform pop
+#[unsafe(no_mangle)]
+pub extern "C" fn RiTransformEnd() {
+    let tstk = &mut MSTATE.lock().unwrap().transform;
+    tstk.pop()
+        .expect("RiTransformEnd called before RiWorldBegin or RtProjection");
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn RiConcatTransform(transform: *const [RtFloat; 4]) {
-    let _ = transform;
+    let tstk = &mut MSTATE.lock().unwrap().transform;
+    let transform: RtMatrix = bytemuck::cast(unsafe { *transform });
+    // assert!(transform.is_invertible());
+    // let transform = RtMatrix::from_matrix_unchecked(transform);
+    *tstk
+        .last_mut()
+        .expect("RiConcatTransform called before RiWorldBegin or RtProjection") *= transform;
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiTranslate(dx: RtFloat, dy: RtFloat, dz: RtFloat) {
-    let _ = (dx, dy, dz);
+    let tstk = &mut MSTATE.lock().unwrap().transform;
+    tstk.last_mut()
+        .expect("RiTranslate called before RiWorldBegin or RtProjection")
+        .matrix_mut_unchecked()
+        .append_translation_mut(&RtVector::new(dx, dy, dz));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiRotate(angle: RtFloat, dx: RtFloat, dy: RtFloat, dz: RtFloat) {
-    let _ = (angle, dx, dy, dz);
+    let tstk = &mut MSTATE.lock().unwrap().transform;
+    *tstk
+        .last_mut()
+        .expect("RiTranslate called before RiTransformBegin")
+        .matrix_mut_unchecked() *=
+        Matrix4::from_axis_angle(&RtNormal::new_unchecked(RtVector::new(dx, dy, dz)), angle);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiScale(sx: RtFloat, sy: RtFloat, sz: RtFloat) {
-    let _ = (sx, sy, sz);
+    let tstk = &mut MSTATE.lock().unwrap().transform;
+    tstk.last_mut()
+        .expect("RiTranslate called before RiWorldBegin or RtProjection")
+        .matrix_mut_unchecked()
+        .append_nonuniform_scaling_mut(&RtVector::new(sx, sy, sz));
 }
 
 /* ---------------------------------------------------------------- primitives */
@@ -300,7 +507,71 @@ pub extern "C" fn RiScale(sx: RtFloat, sy: RtFloat, sz: RtFloat) {
 /// needs the neighbors, which is why it waits for the whole first pass.
 #[unsafe(no_mangle)]
 pub extern "C" fn RiSphere(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thetamax: RtFloat) {
-    let _ = (radius, zmin, zmax, thetamax);
+    let mstate = MSTATE.lock().unwrap();
+    let t = mstate
+        .transform
+        .last()
+        .expect("RiSphere called before RiTransformBegin");
+    let p = mstate
+        .projection
+        .expect("RiSphere called before RiWorldBegin");
+
+    let mut rstate = RSTATE.lock().unwrap();
+    let sbuf = rstate
+        .sample_buffer
+        .as_mut()
+        .expect("RiSphere called before RiWorldBegin");
+    let (sbrows, sbcols, ..) = sbuf.dim();
+
+    let ther = thetamax.to_radians();
+    let phis = zmin.asin();
+    let phir = zmax.asin() - phis;
+
+    let dicerate = 100;
+    // theta range / 2pi * phi range / pi * 4pir^2 / dicerate^2
+    let msize = (radius * radius)
+        .algebraic_mul(phir)
+        .algebraic_mul(thetamax)
+        .algebraic_mul(const { 4. / 360. })
+        .algebraic_div((dicerate * dicerate) as _);
+
+    for i in 0..dicerate {
+        let u = i as f32 / dicerate as f32;
+        let theta = ther.algebraic_mul(u as _);
+        let (sinth, costh) = theta.sin_cos();
+
+        for j in 0..dicerate {
+            let v = j as f32 / dicerate as f32;
+            let phi = phis.algebraic_add(phir.algebraic_mul(v as _));
+            let (sinph, cosph) = phi.sin_cos();
+
+            let norm =
+                UnitVector3::new_unchecked(Vector3::new(sinth * cosph, sinth * sinph, costh));
+            let rpos = RtPoint::from(norm.scale(radius)); // object-space
+            let mut mp = MicroPolygon {
+                P: t.transform_point(&rpos),
+                Po: rpos,
+                N: t.transform_vector(&norm).normalize(),
+                u,
+                v,
+                Cs: mstate.color,
+                Os: mstate.opacity,
+            };
+            mp.displace(mstate.displace, mstate.displace_params.clone()); // TODO recompute norms after
+            mp.surface(mstate.surface, mstate.surface_params.clone());
+
+            let Pss: RtPoint = p.transform_point(&mp.P);
+            sbuf[(
+                ((Pss.x + 1.) / 2. * sbrows as f32) as usize,
+                ((Pss.y + 1.) / 2. * sbcols as f32) as usize,
+            )]
+                .push(Sample {
+                    z: Pss.z,
+                    Cs: mp.Cs,
+                    Os: mp.Os,
+                });
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -351,12 +622,16 @@ pub unsafe extern "C" fn RiPointsPolygons(
 /// An RtColor argument arrives as a pointer to its three floats.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn RiColor(color: *const RtFloat) {
-    let _ = color;
+    let mut s = MSTATE.lock().unwrap();
+    let color: &RtColor = unsafe { &*(color as *const _) };
+    s.color = *color;
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn RiOpacity(opacity: *const RtFloat) {
-    let _ = opacity;
+    let mut s = MSTATE.lock().unwrap();
+    let opacity: &RtColor = unsafe { &*(opacity as *const _) };
+    s.opacity = *opacity;
 }
 
 /// Bind a shader to the primitives that follow. Copy nbytes of params now
@@ -365,31 +640,70 @@ pub unsafe extern "C" fn RiOpacity(opacity: *const RtFloat) {
 /// means STANDARD for RiSurface and no displacement for RiDisplacement
 /// (Section 5).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn RiSurface(fn_: RtShaderFn, params: *const c_void, nbytes: usize) {
-    let _ = (fn_, params, nbytes);
+pub unsafe extern "C" fn RiSurface(shader: RtShaderFn, params: *const c_void, nbytes: usize) {
+    let mut s = MSTATE.lock().unwrap();
+    s.surface = shader;
+    s.surface_params = if !params.is_null() && nbytes > 0 {
+        // SAFETY: params null check, u8 is always valid
+        let params = unsafe { std::slice::from_raw_parts(params as *const u8, nbytes) };
+        Some(params.into())
+    } else {
+        None
+    }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn RiDisplacement(fn_: RtShaderFn, params: *const c_void, nbytes: usize) {
-    let _ = (fn_, params, nbytes);
+pub unsafe extern "C" fn RiDisplacement(shader: RtShaderFn, params: *const c_void, nbytes: usize) {
+    let mut s = MSTATE.lock().unwrap();
+    s.displace = shader;
+    s.displace_params = if !params.is_null() && nbytes > 0 {
+        // SAFETY: params null check, u8 is always valid
+        let params = unsafe { std::slice::from_raw_parts(params as *const u8, nbytes) };
+        Some(params.into())
+    } else {
+        None
+    }
 }
 
 /// Load an image into one of 8 texture slots with the image crate
-/// (image::open; look for the file as given, then under textures/), and
+/// (image::open; look for the file as given, then under textures/)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn RiMakeTexture(file: *const c_char, slot: RtInt) {
+    let path = unsafe { read_token(file) };
+    let image = image::open(path).expect("RiMakeTexture called with invalid file");
+
+    let mut mstate = MSTATE.lock().unwrap();
+    mstate.textures[slot as usize] = Some(image);
+}
+
 /// look it up bilinearly with repeat wrap: s runs left to right, t from the
 /// TOP row (t = 0) to the bottom (Section 6). An empty slot reads black.
 /// result points at three floats.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn RiMakeTexture(file: *const c_char, slot: RtInt) {
-    let _ = (unsafe { token(file) }, slot);
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn RiTexture(slot: RtInt, s: RtFloat, t: RtFloat, result: *mut RtFloat) {
-    let _ = (slot, s, t);
-    unsafe {
-        for i in 0..3 {
-            *result.add(i) = 0.0;
+    let result: &mut RtVector = unsafe { &mut *(result as *mut _) };
+
+    let mstate = MSTATE.lock().unwrap();
+    let image = mstate.textures[slot as usize]
+        .as_ref()
+        .expect("RiTexture called with invalid slot");
+
+    let (w, h) = image.dimensions();
+    let x = (s - s.floor()) * w as RtFloat;
+    let y = (t - t.floor()) * h as RtFloat;
+
+    result.fill(0.);
+    for sx in [x.floor(), x.ceil()] {
+        for sy in [y.floor(), y.ceil()] {
+            *result += (1.0 - (x - sx).abs())
+                * (1.0 - (y - sy).abs())
+                * RtVector::from_row_slice(
+                    &image
+                        .get_pixel(sx as _, sy as _)
+                        .to_rgb()
+                        .0
+                        .map(|x| x as RtFloat / u8::MAX as RtFloat),
+                );
         }
     }
 }
@@ -406,8 +720,9 @@ fn extension(name: &str) -> String {
 }
 
 /// A value clamped to [0, 1], as an 8-bit integer.
+#[inline]
 fn to8(v: f32) -> u8 {
-    (v.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u8
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 /// Write the picture to renders/<RiDisplay name>, in the format its
@@ -424,51 +739,47 @@ fn to8(v: f32) -> u8 {
 ///               programs ignore a BMP's. They get the picture over the
 ///               black background, which is the premultiplied color itself.
 /// Values are clamped to [0, 1] and rounded to 8 bits.
-pub fn write_image(rgba: &[f32]) {
-    let (w, h, name) = {
-        let o = OPTIONS.lock().unwrap();
-        (o.xres as u32, o.yres as u32, o.display.clone())
-    };
+pub fn write_image(rgba: Array3<u8>, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("renders/{}", name);
-    if rgba.len() != (w as usize) * (h as usize) * 4 {
-        eprintln!("write_image: the buffer is not {} x {} x 4 floats", w, h);
-        return;
-    }
     let ext = extension(&name);
     let keep_alpha = match ext.as_str() {
         "png" | "tga" => true,
         "jpg" | "jpeg" | "bmp" => false,
         _ => {
-            eprintln!("cannot write {}: use .png, .bmp, .tga or .jpg", path);
-            return;
+            return Err(format!("cannot write {}: use .png, .bmp, .tga or .jpg", path).into());
         }
     };
 
-    let comp = if keep_alpha { 4 } else { 3 }; // with alpha, or without
-    let mut bytes = Vec::with_capacity((w * h) as usize * comp);
-    for px in rgba.chunks_exact(4) {
-        let alpha = px[3].clamp(0.0, 1.0);
-        for c in 0..3 {
-            let straight = if alpha > 0.0 { px[c] / alpha } else { 0.0 };
-            bytes.push(to8(if keep_alpha { straight } else { px[c] }));
-        }
-        if keep_alpha {
-            bytes.push(to8(alpha));
-        }
-    }
+    let (rgbar, rgbac, depth) = rgba.dim();
+    debug_assert_eq!(depth, 4);
+    if keep_alpha {
+        let (raw, off) = rgba.into_raw_vec_and_offset();
+        debug_assert_matches!(off, Some(0) | None);
 
-    let result = if keep_alpha {
-        let image = image::RgbaImage::from_raw(w, h, bytes).expect("w * h * 4 bytes");
-        let format = if ext == "png" {
-            image::ImageFormat::Png
-        } else {
-            image::ImageFormat::Tga
-        };
-        image.save_with_format(&path, format)
+        let image = image::RgbaImage::from_raw(rgbac as _, rgbar as _, raw)
+            .ok_or("write_image called with invalid buffer")?;
+        Ok(image.save_with_format(
+            &path,
+            if ext == "png" {
+                image::ImageFormat::Png
+            } else {
+                image::ImageFormat::Tga
+            },
+        )?)
     } else {
-        let image = image::RgbImage::from_raw(w, h, bytes).expect("w * h * 3 bytes");
-        if ext == "bmp" {
-            image.save_with_format(&path, image::ImageFormat::Bmp)
+        let rgba = rgba.mapv(|x| x as u16);
+        let rgb = rgba.slice(s![.., .., 0..3]); // (H, W, 3) view  
+        let alpha = rgba.slice(s![.., .., 3..4]); // (H, W, 1) view  
+        let rgba = ((&rgb * &alpha) / 255).mapv(|x| x as u8).to_owned(); // broadcast → (H, W, 3)
+        debug_assert_eq!(rgba.dim().2, 3);
+
+        let (raw, off) = rgba.into_raw_vec_and_offset();
+        debug_assert_matches!(off, Some(0) | None);
+
+        let image = image::RgbImage::from_raw(rgbac as _, rgbar as _, raw)
+            .ok_or("write_image called with invalid buffer")?;
+        Ok(if ext == "bmp" {
+            image.save_with_format(&path, image::ImageFormat::Bmp)?
         } else {
             std::fs::File::create(&path)
                 .map_err(image::ImageError::IoError)
@@ -476,15 +787,8 @@ pub fn write_image(rgba: &[f32]) {
                     let mut out = std::io::BufWriter::new(file);
                     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95)
                         .encode_image(&image)
-                })
-        }
-    };
-    match result {
-        Ok(()) => println!("wrote {} ({} x {})", path, w, h),
-        Err(e) => eprintln!(
-            "could not write {} ({}; run reyes from the kit root)",
-            path, e
-        ),
+                })?
+        })
     }
 }
 
@@ -494,28 +798,24 @@ pub fn write_image(rgba: &[f32]) {
 /// at least half opaque, +infinity where there is none). Complete: call it
 /// from RiWorldEnd when RiDisplay asked for depth. The scene that reads the
 /// file back knows the camera it was rendered with.
-pub fn write_depth(depth: &[f32]) {
-    let (w, h, name) = {
-        let o = OPTIONS.lock().unwrap();
-        (o.xres, o.yres, o.display.clone())
-    };
-    let path = format!("renders/{}", name);
-    if depth.len() != (w as usize) * (h as usize) {
-        eprintln!("write_depth: the buffer is not {} x {} floats", w, h);
-        return;
-    }
+pub fn write_depth(depth: &Array2<f32>, path: &str) {
     let result = std::fs::File::create(&path).and_then(|file| {
         let mut out = std::io::BufWriter::new(file);
         out.write_all(b"Rz01")?;
-        out.write_all(&w.to_le_bytes())?;
-        out.write_all(&h.to_le_bytes())?;
+        out.write_all(&depth.dim().0.to_le_bytes())?;
+        out.write_all(&depth.dim().1.to_le_bytes())?;
         for d in depth {
             out.write_all(&d.to_le_bytes())?;
         }
         out.flush()
     });
     match result {
-        Ok(()) => println!("wrote {} ({} x {} depth)", path, w, h),
+        Ok(()) => println!(
+            "wrote {} ({} x {} depth)",
+            path,
+            depth.dim().0,
+            depth.dim().1
+        ),
         Err(e) => eprintln!(
             "could not write {} ({}; run reyes from the kit root)",
             path, e
