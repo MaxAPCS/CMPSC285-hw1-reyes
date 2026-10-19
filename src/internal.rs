@@ -2,9 +2,9 @@ use crate::shaders;
 
 use image::buffer::ConvertBuffer;
 use image::{DynamicImage, ImageFormat};
-use nalgebra::{Point3, Projective3, UnitVector3, Vector3};
+use nalgebra::{Point3, Projective3, UnitVector3, Vector2, Vector3};
 use ndarray::parallel::prelude::{IntoParallelRefMutIterator, ParallelIterator};
-use ndarray::{Array1, Array2, Array3, Axis, Zip};
+use ndarray::{Array1, Array2, Array3, Axis, Zip, array};
 use std::debug_assert_matches;
 use std::io::Write;
 use std::sync::Arc;
@@ -86,6 +86,42 @@ impl ModelState {
         self.displace_params = params;
     }
 
+    #[inline]
+    pub fn bounds_clipspace(&self, opos: &[Point3<f32>]) -> Vector2<f32> {
+        let t = self
+            .transform_last()
+            .expect("bounds_clipspace called without transform");
+        let proj = self
+            .projection
+            .expect("bounds_clipspace called without projection");
+
+        let mut pcc = Array2::uninit((opos.len(), 2));
+        Zip::from(opos)
+            .and(pcc.lanes_mut(Axis(1)))
+            .par_for_each(|p, mut pcc| {
+                let p = proj.transform_point(&t.transform_point(p)).xy();
+                pcc.assign(&array![MaybeUninit::new(p.x), MaybeUninit::new(p.y)]);
+            });
+        let pcc = unsafe { pcc.assume_init() };
+
+        fn range<'a>(iter: impl IntoIterator<Item = &'a f32>) -> (f32, f32) {
+            iter.into_iter().fold((f32::MAX, f32::MIN), |mut r, &x| {
+                if r.0 > x {
+                    r.0 = x
+                }
+                if r.1 < x {
+                    r.1 = x
+                }
+                r
+            })
+        }
+
+        let (xmin, xmax) = range(pcc.row(0));
+        let (ymin, ymax) = range(pcc.row(1));
+
+        Vector2::new(xmax - xmin, ymax - ymin)
+    }
+
     pub fn shade_project_pass(&self, mut mvs: Array2<MicroVertex>) -> Array2<Option<MicroVertex>> {
         let p = self
             .projection
@@ -111,7 +147,7 @@ impl ModelState {
             }
             mv.surface(self.surface, self.surface_params.clone());
 
-            // Projection
+            // Projection (cpos is now clip position)
             mv.cpos = p.transform_point(&mv.cpos);
             if mv.cpos.x <= -1.
                 || mv.cpos.x > 1.
@@ -173,7 +209,7 @@ impl MicroVertex {
     }
 }
 
-#[derive(Clone)] // exclusively so populating the Array2 works
+#[derive(Clone, Copy)] // exclusively so populating the Array2 works
 struct Sample {
     cdepth: f32,
     color: Vector3<f32>,
@@ -216,6 +252,15 @@ impl RenderState {
             depth_display: false,
             sample_buffer: None,
         }
+    }
+
+    #[inline]
+    pub fn diag_pixels_screenspace(&self, ssv: &Vector2<f32>) -> usize {
+        let x = (1. - ssv.y).algebraic_mul((self.hight / 2) as f32);
+        let y = (ssv.x + 1.).algebraic_mul((self.width / 2) as f32);
+        f32::algebraic_add(x.algebraic_mul(x), y.algebraic_mul(y))
+            .sqrt()
+            .ceil() as usize
     }
 
     #[inline]
@@ -322,11 +367,24 @@ impl RenderState {
         debug_assert_matches!(off, Some(0) | None);
         image::RgbaImage::from_raw(self.width as _, self.hight as _, fbuf)
     }
+}
 
-    #[inline]
-    pub fn maxdim(&self) -> usize {
-        usize::max(self.width, self.hight)
-    }
+/// Write the depth image to renders/<RiDisplay name> in the handout's
+/// format: "Rz01", int32 width and height, then one float per pixel, top
+/// row first, all little-endian (the camera-space z of the nearest surface
+/// at least half opaque, +infinity where there is none).
+pub fn write_depth(depth: &Array2<f32>, path: &str) -> Result<(), std::io::Error> {
+    let path = format!("renders/{}", path);
+    std::fs::File::create(&path).and_then(|file| {
+        let mut out = std::io::BufWriter::new(file);
+        out.write_all(b"Rz01")?;
+        out.write_all(&(depth.dim().1 as i32).to_le_bytes())?;
+        out.write_all(&(depth.dim().0 as i32).to_le_bytes())?;
+        for d in depth {
+            out.write_all(&d.to_le_bytes())?;
+        }
+        out.flush()
+    })
 }
 
 pub fn write_image(rgba: image::RgbaImage, path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -355,36 +413,4 @@ pub fn write_image(rgba: image::RgbaImage, path: &str) -> Result<(), Box<dyn std
             .into());
         }
     })
-}
-
-/// Write the depth image to renders/<RiDisplay name> in the handout's
-/// format: "Rz01", int32 width and height, then one float per pixel, top
-/// row first, all little-endian (the camera-space z of the nearest surface
-/// at least half opaque, +infinity where there is none). Complete: call it
-/// from RiWorldEnd when RiDisplay asked for depth. The scene that reads the
-/// file back knows the camera it was rendered with.
-pub fn write_depth(depth: &Array2<f32>, path: &str) {
-    let path = format!("renders/{}", path);
-    let result = std::fs::File::create(&path).and_then(|file| {
-        let mut out = std::io::BufWriter::new(file);
-        out.write_all(b"Rz01")?;
-        out.write_all(&(depth.dim().0 as i32).to_le_bytes())?;
-        out.write_all(&(depth.dim().1 as i32).to_le_bytes())?;
-        for d in depth {
-            out.write_all(&d.to_le_bytes())?;
-        }
-        out.flush()
-    });
-    match result {
-        Ok(()) => println!(
-            "wrote {} ({} x {} depth)",
-            path,
-            depth.dim().0,
-            depth.dim().1
-        ),
-        Err(e) => eprintln!(
-            "could not write {} ({}; run reyes from the kit root)",
-            path, e
-        ),
-    }
 }
