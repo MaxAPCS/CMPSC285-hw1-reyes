@@ -577,8 +577,8 @@ void WallEMovie(void)
 
     std::error_code ignored;
     std::filesystem::create_directories("renders/3_CinematicScenes/WallEMovie", ignored);
-    ObjMesh *walle = obj_load("assets/models/walle/walle.obj");
-    RigidAnim *anim = anim_load("assets/models/walle/walle_anim.txt");
+    ObjMesh *walle = obj_load("models/walle/walle.obj");
+    RigidAnim *anim = anim_load("models/walle/walle_anim.txt");
 
     RiBegin(RI_NULL);
         RiMakeTexture("models/walle/walle_color.png", 0);

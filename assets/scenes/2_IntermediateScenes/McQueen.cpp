@@ -117,7 +117,7 @@ void McQueen(void)
                 RiSurface(CHECKERBOARD, &cp, sizeof cp);
                 Floor();
 
-                ObjMesh *car = obj_load("assets/models/mcqueen/mcqueen.obj");
+                ObjMesh *car = obj_load("models/mcqueen/mcqueen.obj");
                 DrawCar(car);
 
                 /* its mirror image under the floor */

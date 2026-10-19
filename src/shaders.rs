@@ -15,10 +15,32 @@
 
 #![allow(non_snake_case)] // the shader names are the handout's
 
-use nalgebra::{Point3, SimdComplexField, UnitVector3, Vector3};
-
-use crate::ri::{RtColor, RtFloat, RtInt, RtPoint, RtShaderContext, RtShaderFn};
+use crate::ri_api::{RtColor, RtFloat, RtInt, RtNormal, RtPoint};
 use std::ffi::c_void;
+
+/// What a shader sees at one grid vertex (Ri.h's RtShaderContext, same
+/// layout). The renderer fills in the inputs; a displacement shader moves
+/// P, a surface shader writes Ci and Oi.
+#[repr(C)]
+pub struct RtShaderContext {
+    /* inputs, filled by the renderer at each grid vertex */
+    pub P: RtPoint,  /* position of grid vertex in camera/eye space */
+    pub Po: RtPoint, /* same point in object space */
+    pub N: RtNormal, /* unit normal, recomputed after displacement */
+    pub u: RtFloat,  /* surface parameters in [0,1], or a mesh's st */
+    pub v: RtFloat,
+    pub Cs: RtColor, /* current RiColor and RiOpacity */
+    pub Os: RtColor,
+    pub params: *const c_void, /* this shader's parameter block, or null */
+    /* outputs */
+    pub Ci: RtColor, /* written by surface shaders */
+    pub Oi: RtColor,
+    /* displacement shaders modify P in place */
+}
+
+/// A shader: a C function pointer, or None where a scene passes NULL
+/// (RiSurface(NULL, NULL, 0) means STANDARD).
+pub type RtShaderFn = Option<unsafe extern "C" fn(*mut RtShaderContext)>;
 
 /* ------------------------------------------------------------- CONSTANT */
 
@@ -45,18 +67,18 @@ struct StandardLight {
 
 const DEFAULTLIGHTS: [StandardLight; 3] = [
     StandardLight {
-        P: Point3::new(-6., 8., -4.),
-        C: Vector3::new(1., 0.95, 0.85),
+        P: RtPoint::new(-6., 8., -4.),
+        C: RtColor::new(1., 0.95, 0.85),
         I: 1.0,
     },
     StandardLight {
-        P: Point3::new(7., 3., -2.),
-        C: Vector3::new(0.6, 0.7, 1.),
+        P: RtPoint::new(7., 3., -2.),
+        C: RtColor::new(0.6, 0.7, 1.),
         I: 0.4,
     },
     StandardLight {
-        P: Point3::new(0., 5., 18.),
-        C: Vector3::new(1., 0.95, 0.85),
+        P: RtPoint::new(0., 5., 18.),
+        C: RtColor::new(1., 0.95, 0.85),
         I: 1.0,
     },
 ];
@@ -96,19 +118,21 @@ pub unsafe extern "C" fn STANDARD(c: *mut RtShaderContext) {
     let ctx = unsafe { &mut *c };
     let par = &DEFAULTSTANDARD;
 
-    let mut diffuse = Vector3::zeros();
-    let mut specular = Vector3::zeros();
+    let mut diffuse = RtColor::zeros();
+    let mut specular = RtColor::zeros();
     for light in par.lights {
-        let L = UnitVector3::new_normalize(light.P - ctx.P);
+        let L = RtNormal::new_normalize(light.P - ctx.P);
         let NL = ctx.N.dot(&L);
         diffuse += NL.max(0.) * light.I * light.C;
 
         let R = *ctx.N * 2. * NL - *L;
-        let V = UnitVector3::new_normalize(-ctx.P.coords);
-        specular += R.dot(&V).max(0.).simd_powi(par.spec_exp as _) * light.I * light.C;
+        let V = RtNormal::new_normalize(-ctx.P.coords);
+        specular += nalgebra::SimdComplexField::simd_powi(R.dot(&V).max(0.), par.spec_exp as _)
+            * light.I
+            * light.C;
     }
 
-    ctx.Ci = (par.ka * const { Vector3::new(1., 1., 1.) } + par.kd * diffuse + par.ks * specular)
+    ctx.Ci = (par.ka * const { RtColor::new(1., 1., 1.) } + par.kd * diffuse + par.ks * specular)
         .component_mul(&ctx.Cs);
     ctx.Oi = ctx.Os;
 }
@@ -168,7 +192,7 @@ pub unsafe extern "C" fn CHECKERBOARD(c: *mut RtShaderContext) {
         if let Some(dark) = par.dark {
             unsafe { dark(ctx) }
         } else {
-            ctx.Cs = Vector3::zeros();
+            ctx.Cs = RtColor::zeros();
             unsafe { STANDARD(ctx) }
         }
 
@@ -313,17 +337,17 @@ pub unsafe extern "C" fn BUMPY(c: *mut RtShaderContext) {
     let par = unsafe { &*(ctx.params as *const BumpParams) };
 
     let n = par.max_freq_exp - par.min_freq_exp;
-    let scale = 2.0 * (1.0 - (2 << -1 - n) as f32);
+    let scale = 2.0 * (1.0 - ((-1 - n) as f64).exp2());
 
     let mut h = 0.0;
     let mut ampl = 1.0;
     let mut freq = (2 << par.min_freq_exp as usize) as f32 * ctx.Po;
 
     for _ in 0..=n {
-        h += perlin_noise(freq.cast()) as f32 * ampl;
+        h += perlin_noise(freq.cast()) * ampl;
         ampl *= 0.5;
         freq *= 2.0;
     }
 
-    ctx.P += ctx.N.scale(h * par.amplitude / scale);
+    ctx.P += ctx.N.scale((h / scale) as f32 * par.amplitude);
 }

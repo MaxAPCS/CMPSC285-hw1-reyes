@@ -425,7 +425,7 @@ void HelmetGlass(RtShaderContext *c)
 void BuzzModel(void)
 {
     RtColor white = {1, 1, 1}, opaque = {1, 1, 1};
-    ObjMesh *buzz = obj_load("assets/models/buzz/buzz.obj");
+    ObjMesh *buzz = obj_load("models/buzz/buzz.obj");
     TextureParams tp = {0, &KEY_SHADOW};
     for (int k = 0; buzz && k < buzz->ngroups; ++k) {
         const ObjGroup &g = buzz->groups[k];
@@ -469,7 +469,7 @@ void WoodyModel(void)
     };
     RtColor opaque = {1, 1, 1};
     RiOpacity(opaque);
-    ObjMesh *woody = obj_load("assets/models/woody/woody.obj");
+    ObjMesh *woody = obj_load("models/woody/woody.obj");
     for (int k = 0; woody && k < woody->ngroups; ++k) {
         const ObjGroup &g = woody->groups[k];
         if (std::strcmp(g.material, "band") == 0) {

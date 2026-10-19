@@ -566,7 +566,7 @@ void RadiatorSprings(void)
     LookAt(sunEye, SUN_VIEW_CENTER, sunCamera);
     const RtFloat toWindow = (RtFloat)(1 / SUN_VIEW_HALF_WIDTH); /* the window is [-1, 1] */
 
-    ObjMesh *car = obj_load("assets/models/mcqueen/mcqueen.obj");
+    ObjMesh *car = obj_load("models/mcqueen/mcqueen.obj");
 
     RiBegin(RI_NULL);
         RiMakeTexture("models/mcqueen/McQueenLivery.jpg", 0);

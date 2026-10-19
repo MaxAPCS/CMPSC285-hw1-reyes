@@ -70,7 +70,7 @@ void Buzz(void)
                 RiSurface(CHECKERBOARD, &cp, sizeof cp);
                 Floor(24, 0.5, CAMERA); /* 0.5 m tiles over x, z in [-6, 6] */
 
-                ObjMesh *buzz = obj_load("assets/models/buzz/buzz.obj");
+                ObjMesh *buzz = obj_load("models/buzz/buzz.obj");
                 DrawBuzz(buzz);
 
                 /* his mirror image under the floor */

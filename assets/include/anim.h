@@ -39,7 +39,9 @@ struct RigidAnim {
 /* NULL plus a message on stderr on failure. */
 inline RigidAnim *anim_load(const char *path)
 {
-    std::ifstream in(path);
+    std::string full = "assets/";
+    full += path;
+    std::ifstream in(full);
     if (!in) {
         std::fprintf(stderr, "anim_load: cannot open %s (run from the repo root)\n", path);
         return NULL;

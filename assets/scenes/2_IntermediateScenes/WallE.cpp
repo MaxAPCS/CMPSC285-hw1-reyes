@@ -43,8 +43,8 @@ void WallE(void)
                 RiSurface(CHECKERBOARD, &cp, sizeof cp);
                 Floor(32, 0.25); /* 0.25 m tiles over x, z in [-4, 4] */
 
-                ObjMesh *walle = obj_load("assets/models/walle/walle.obj");
-                RigidAnim *anim = anim_load("assets/models/walle/walle_anim.txt");
+                ObjMesh *walle = obj_load("models/walle/walle.obj");
+                RigidAnim *anim = anim_load("models/walle/walle_anim.txt");
                 const int frames[4] = {1, 70, 140, 210};
                 /* the four Wall-Es, then their mirror images under the floor */
                 for (int mirror = 0; mirror < 2; ++mirror)

@@ -94,7 +94,9 @@ inline int resolve(long i, size_t count)
 inline ObjMesh *obj_load(const char *path)
 {
     using namespace obj_detail;
-    std::ifstream file(path);
+    std::string full = "assets/";
+    full += path;
+    std::ifstream file(full);
     if (!file) {
         std::fprintf(stderr, "obj_load: cannot open %s (run from the repo root)\n", path);
         return NULL;

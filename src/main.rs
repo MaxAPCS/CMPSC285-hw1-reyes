@@ -12,7 +12,8 @@
 //! scenes/0_scene_table.cpp defines (include/scenes.h). The renderer
 //! itself is in ri.rs and shaders.rs.
 
-mod ri;
+mod internal;
+mod ri_api;
 mod shaders;
 
 use std::ffi::{CStr, c_char};
