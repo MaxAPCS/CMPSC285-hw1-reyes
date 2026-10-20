@@ -2,7 +2,7 @@
 
 use crate::{internal::*, shaders};
 
-use nalgebra::{Matrix4, Orthographic3, Perspective3, matrix};
+use nalgebra::{Matrix4, Orthographic3, Perspective3};
 use ndarray::Array2;
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::{Mutex, RwLock};
@@ -29,6 +29,7 @@ unsafe fn read_token(s: RtToken) -> &'static str {
     }
 }
 
+static DICERATE_MIN: usize = 4;
 static DICERATE_MAX: usize = 2048;
 
 static MSTATE: RwLock<ModelState> = RwLock::new(ModelState::default());
@@ -98,11 +99,18 @@ pub extern "C" fn RiFrameBegin(_frame: RtInt) {
 #[unsafe(no_mangle)]
 pub extern "C" fn RiFrameEnd() {
     let mut mstate = MSTATE.write().unwrap();
+    let mut textures = [const { None }; 8];
+    mstate.textures.swap_with_slice(&mut textures);
     *mstate = FRAME_MSTATE
         .lock()
         .unwrap()
         .take()
         .expect("RiFrameEnd called before RiFrameBegin");
+    for (o, n) in std::iter::zip(mstate.textures.iter_mut(), textures) {
+        if let Some(n) = n {
+            *o = Some(n);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -143,27 +151,32 @@ pub extern "C" fn RiWorldEnd() {
 pub extern "C" fn RiProjection(name: RtToken, _token: RtToken, value: RtPointer) {
     let name = unsafe { read_token(name) };
 
-    let rstate = RSTATE.lock().unwrap();
+    let mut rstate = RSTATE.lock().unwrap();
     let aspect = (rstate.width as f32) / (rstate.hight as f32);
     let (n, f) = (0.1, 10000.);
 
-    MSTATE.write().unwrap().set_projection(match name {
-        "perspective" => {
-            let fov = unsafe { *(value as *const _ as *const RtFloat) }.to_radians();
-            let mut persp = Perspective3::new(aspect, fov, n, f).to_projective();
-            persp
-                .matrix_mut_unchecked()
-                .prepend_nonuniform_scaling_mut(&RtVector::new(1.0, 1.0, -1.0));
-            persp
-        }
-        "orthographic" => if aspect >= 1. {
-            Orthographic3::new(-aspect, aspect, -1., 1., f, n)
-        } else {
-            Orthographic3::new(-1., 1., -aspect.recip(), aspect.recip(), f, n)
-        }
-        .to_projective(),
-        _ => panic!("RiProjection called with invalid name"),
-    });
+    let mut mstate = MSTATE.write().unwrap();
+    set_projection(
+        &mut mstate,
+        &mut rstate,
+        match name {
+            "perspective" => {
+                let fov = unsafe { *(value as *const _ as *const RtFloat) }.to_radians();
+                let mut persp = Perspective3::new(aspect, fov, n, f).to_projective();
+                persp
+                    .matrix_mut_unchecked()
+                    .prepend_nonuniform_scaling_mut(&RtVector::new(1.0, 1.0, -1.0));
+                persp
+            }
+            "orthographic" => if aspect >= 1. {
+                Orthographic3::new(-aspect, aspect, -1., 1., f, n)
+            } else {
+                Orthographic3::new(-1., 1., -aspect.recip(), aspect.recip(), f, n)
+            }
+            .to_projective(),
+            _ => panic!("RiProjection called with invalid name"),
+        },
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -211,7 +224,7 @@ pub extern "C" fn RiTranslate(dx: RtFloat, dy: RtFloat, dz: RtFloat) {
         .transform_last_mut()
         .expect("RiTranslate called before RiWorldBegin or RtProjection")
         .matrix_mut_unchecked()
-        .append_translation_mut(&RtVector::new(dx, dy, dz));
+        .prepend_translation_mut(&RtVector::new(dx, dy, dz));
 }
 
 #[unsafe(no_mangle)]
@@ -222,7 +235,7 @@ pub extern "C" fn RiScale(sx: RtFloat, sy: RtFloat, sz: RtFloat) {
         .transform_last_mut()
         .expect("RiTranslate called before RiWorldBegin or RtProjection")
         .matrix_mut_unchecked()
-        .append_nonuniform_scaling_mut(&RtVector::new(sx, sy, sz));
+        .prepend_nonuniform_scaling_mut(&RtVector::new(sx, sy, sz));
 }
 
 /* ------------------------------------------------------------------ shading */
@@ -332,14 +345,14 @@ pub extern "C" fn RiTexture(slot: RtInt, s: RtFloat, t: RtFloat, result: &mut Rt
 
 macro_rules! make_corners {
     ($x:expr, $y:expr, $z1:expr, $z2:expr) => {
-        &[
+        [
             RtPoint::new($x, $y, $z1),
             RtPoint::new(-$x, $y, $z1),
             RtPoint::new($x, -$y, $z1),
-            RtPoint::new($x, $y, $z2),
             RtPoint::new(-$x, -$y, $z1),
-            RtPoint::new($x, -$y, $z2),
+            RtPoint::new($x, $y, $z2),
             RtPoint::new(-$x, $y, $z2),
+            RtPoint::new($x, -$y, $z2),
             RtPoint::new(-$x, -$y, $z2),
         ]
     };
@@ -347,17 +360,17 @@ macro_rules! make_corners {
 
 #[inline]
 fn linear_cofactor(m: Matrix4<f32>) -> nalgebra::Matrix3<f32> {
-    matrix![
-        m[(1,1)]*m[(2,2)] - m[(1,2)]*m[(2,1)],
-        m[(1,2)]*m[(2,0)] - m[(1,0)]*m[(2,2)],
-        m[(1,0)]*m[(2,1)] - m[(1,1)]*m[(2,0)];
-        m[(0,2)]*m[(2,1)] - m[(0,1)]*m[(2,2)],
-        m[(0,0)]*m[(2,2)] - m[(0,2)]*m[(2,0)],
-        m[(0,1)]*m[(2,0)] - m[(0,0)]*m[(2,1)];
-        m[(0,1)]*m[(1,2)] - m[(0,2)]*m[(1,1)],
-        m[(0,2)]*m[(1,0)] - m[(0,0)]*m[(1,2)],
-        m[(0,0)]*m[(1,1)] - m[(0,1)]*m[(1,0)];
-    ]
+    nalgebra::Matrix3::new(
+        m[(1, 1)] * m[(2, 2)] - m[(1, 2)] * m[(2, 1)],
+        m[(1, 2)] * m[(2, 0)] - m[(1, 0)] * m[(2, 2)],
+        m[(1, 0)] * m[(2, 1)] - m[(1, 1)] * m[(2, 0)],
+        m[(0, 2)] * m[(2, 1)] - m[(0, 1)] * m[(2, 2)],
+        m[(0, 0)] * m[(2, 2)] - m[(0, 2)] * m[(2, 0)],
+        m[(0, 1)] * m[(2, 0)] - m[(0, 0)] * m[(2, 1)],
+        m[(0, 1)] * m[(1, 2)] - m[(0, 2)] * m[(1, 1)],
+        m[(0, 2)] * m[(1, 0)] - m[(0, 0)] * m[(1, 2)],
+        m[(0, 0)] * m[(1, 1)] - m[(0, 1)] * m[(1, 0)],
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -369,10 +382,10 @@ pub extern "C" fn RiSphere(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thetam
         .expect("RiSphere called before RiTransformBegin");
     let tdual = linear_cofactor(*t.matrix());
 
-    let dicerate = (2 * rstate.diag_pixels_screenspace(
-        &mstate.bounds_clipspace(make_corners!(radius, radius, zmax, zmin)),
-    ))
-    .clamp(2, DICERATE_MAX);
+    let dicerate = (2 * rstate.viewport_bounds_diag(rstate.project_bounds(
+        &make_corners!(radius, radius, zmin, zmax).map(|p| t.transform_point(&p)),
+    )))
+    .clamp(DICERATE_MIN, DICERATE_MAX);
 
     let ther = thetamax.to_radians();
     let phis = (zmin / radius).clamp(-1., 1.).asin();
@@ -399,7 +412,7 @@ pub extern "C" fn RiSphere(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thetam
         }
     });
 
-    rstate.sample_pass(mstate.shade_project_pass(mvs));
+    rstate.project_sample_pass(mstate.shade_pass(mvs));
 }
 
 #[unsafe(no_mangle)]
@@ -411,10 +424,10 @@ pub extern "C" fn RiCylinder(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thet
         .expect("RiSphere called before RiTransformBegin");
     let tdual = linear_cofactor(*t.matrix());
 
-    let dicerate = (2 * rstate.diag_pixels_screenspace(
-        &mstate.bounds_clipspace(make_corners!(radius, radius, zmax, zmin)),
-    ))
-    .clamp(2, DICERATE_MAX);
+    let dicerate = (2 * rstate.viewport_bounds_diag(rstate.project_bounds(
+        &make_corners!(radius, radius, zmin, zmax).map(|p| t.transform_point(&p)),
+    )))
+    .clamp(DICERATE_MIN, DICERATE_MAX);
 
     let ther = thetamax.to_radians();
 
@@ -438,7 +451,7 @@ pub extern "C" fn RiCylinder(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thet
         }
     }
 
-    rstate.sample_pass(mstate.shade_project_pass(unsafe { mvs.assume_init() }));
+    rstate.project_sample_pass(mstate.shade_pass(unsafe { mvs.assume_init() }));
 }
 
 #[unsafe(no_mangle)]
@@ -450,10 +463,10 @@ pub extern "C" fn RiCone(height: RtFloat, radius: RtFloat, thetamax: RtFloat) {
         .expect("RiSphere called before RiTransformBegin");
     let tdual = linear_cofactor(*t.matrix());
 
-    let dicerate = (2 * rstate.diag_pixels_screenspace(
-        &mstate.bounds_clipspace(make_corners!(radius, radius, height, 0.)),
-    ))
-    .clamp(2, DICERATE_MAX);
+    let dicerate = (2 * rstate.viewport_bounds_diag(rstate.project_bounds(
+        &make_corners!(radius, radius, height, 0.).map(|p| t.transform_point(&p)),
+    )))
+    .clamp(DICERATE_MIN, DICERATE_MAX);
 
     let ther = thetamax.to_radians();
 
@@ -478,13 +491,13 @@ pub extern "C" fn RiCone(height: RtFloat, radius: RtFloat, thetamax: RtFloat) {
         }
     }
 
-    rstate.sample_pass(mstate.shade_project_pass(unsafe { mvs.assume_init() }));
+    rstate.project_sample_pass(mstate.shade_pass(unsafe { mvs.assume_init() }));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiTorus(
-    majorradius: RtFloat,
-    minorradius: RtFloat,
+    marad: RtFloat,
+    mirad: RtFloat,
     phimin: RtFloat,
     phimax: RtFloat,
     thetamax: RtFloat,
@@ -496,14 +509,11 @@ pub extern "C" fn RiTorus(
         .expect("RiSphere called before RiTransformBegin");
     let tdual = linear_cofactor(*t.matrix());
 
-    let totalradius = majorradius + minorradius;
-    let dicerate = (2 * rstate.diag_pixels_screenspace(&mstate.bounds_clipspace(make_corners!(
-        totalradius,
-        totalradius,
-        minorradius,
-        -minorradius
-    ))))
-    .clamp(2, DICERATE_MAX);
+    let torad = marad + mirad;
+    let dicerate = (2 * rstate.viewport_bounds_diag(rstate.project_bounds(
+        &make_corners!(torad, torad, -mirad, mirad).map(|p| t.transform_point(&p)),
+    )))
+    .clamp(DICERATE_MIN, DICERATE_MAX);
 
     let ther = thetamax.to_radians();
     let phis = phimin.to_radians();
@@ -516,10 +526,10 @@ pub extern "C" fn RiTorus(
         for j in 0..mvs.dim().1 {
             let v = j as f32 / dicerate as f32;
             let (sinph, cosph) = (phis + (v * phir)).sin_cos();
-            let r = majorradius + minorradius * cosph;
+            let r = marad + mirad * cosph;
 
             let norm = RtVector::new(cosph * costh, cosph * sinth, sinph);
-            let opos = RtPoint::new(r * costh, r * sinth, minorradius * sinph);
+            let opos = RtPoint::new(r * costh, r * sinth, mirad * sinph);
             mvs[(i, j)].write(MicroVertex {
                 cpos: t.transform_point(&opos),
                 opos,
@@ -531,7 +541,7 @@ pub extern "C" fn RiTorus(
         }
     }
 
-    rstate.sample_pass(mstate.shade_project_pass(unsafe { mvs.assume_init() }));
+    rstate.project_sample_pass(mstate.shade_pass(unsafe { mvs.assume_init() }));
 }
 
 /// A mesh of polygons: polygon i has nverts[i] corners, whose indices into

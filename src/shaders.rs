@@ -341,10 +341,10 @@ pub unsafe extern "C" fn BUMPY(c: *mut RtShaderContext) {
 
     let mut h = 0.0;
     let mut ampl = 1.0;
-    let mut freq = (2 << par.min_freq_exp as usize) as f32 * ctx.Po;
+    let mut freq = (1 << par.min_freq_exp as usize) as f64 * ctx.Po.cast();
 
     for _ in 0..=n {
-        h += perlin_noise(freq.cast()) * ampl;
+        h += perlin_noise(freq) * ampl;
         ampl *= 0.5;
         freq *= 2.0;
     }

@@ -1,14 +1,15 @@
 use crate::shaders;
+use sample::*;
 
 use image::buffer::ConvertBuffer;
 use image::{DynamicImage, ImageFormat};
-use nalgebra::{Point3, Projective3, UnitVector3, Vector2, Vector3};
+use nalgebra::{Matrix3, Point2, Point3, Projective3, UnitVector3, Vector2, Vector3};
 use ndarray::parallel::prelude::{IntoParallelRefMutIterator, ParallelIterator};
-use ndarray::{Array1, Array2, Array3, Axis, Zip, array};
+use ndarray::{Array1, Array2, Array3, Axis, Zip};
 use std::debug_assert_matches;
 use std::io::Write;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
-use std::{collections::BinaryHeap, mem::MaybeUninit};
 
 const WHITE: Vector3<f32> = Vector3::new(1., 1., 1.);
 
@@ -23,8 +24,7 @@ pub struct ModelState {
     displace: shaders::RtShaderFn,
     displace_params: Option<Arc<[u8]>>,
 
-    projection: Option<Projective3<f32>>,
-    pub textures: [Option<DynamicImage>; 8],
+    pub textures: [Option<DynamicImage>; 8], // FIXME don't reset this in frame
 }
 impl ModelState {
     #[inline]
@@ -37,7 +37,6 @@ impl ModelState {
             surface_params: None,
             displace: None,
             displace_params: None,
-            projection: None,
             textures: [const { None }; 8],
         }
     }
@@ -69,12 +68,6 @@ impl ModelState {
     }
 
     #[inline]
-    pub fn set_projection(&mut self, projection: Projective3<f32>) {
-        self.projection = Some(projection);
-        self.transform = vec![Projective3::identity()];
-    }
-
-    #[inline]
     pub fn set_surface(&mut self, shader: shaders::RtShaderFn, params: Option<Arc<[u8]>>) {
         self.surface = shader;
         self.surface_params = params;
@@ -86,47 +79,8 @@ impl ModelState {
         self.displace_params = params;
     }
 
-    #[inline]
-    pub fn bounds_clipspace(&self, opos: &[Point3<f32>]) -> Vector2<f32> {
-        let t = self
-            .transform_last()
-            .expect("bounds_clipspace called without transform");
-        let proj = self
-            .projection
-            .expect("bounds_clipspace called without projection");
-
-        let mut pcc = Array2::uninit((opos.len(), 2));
-        Zip::from(opos)
-            .and(pcc.lanes_mut(Axis(1)))
-            .par_for_each(|p, mut pcc| {
-                let p = proj.transform_point(&t.transform_point(p)).xy();
-                pcc.assign(&array![MaybeUninit::new(p.x), MaybeUninit::new(p.y)]);
-            });
-        let pcc = unsafe { pcc.assume_init() };
-
-        fn range<'a>(iter: impl IntoIterator<Item = &'a f32>) -> (f32, f32) {
-            iter.into_iter().fold((f32::MAX, f32::MIN), |mut r, &x| {
-                if r.0 > x {
-                    r.0 = x
-                }
-                if r.1 < x {
-                    r.1 = x
-                }
-                r
-            })
-        }
-
-        let (xmin, xmax) = range(pcc.row(0));
-        let (ymin, ymax) = range(pcc.row(1));
-
-        Vector2::new(xmax - xmin, ymax - ymin)
-    }
-
-    pub fn shade_project_pass(&self, mut mvs: Array2<MicroVertex>) -> Array2<Option<MicroVertex>> {
-        let p = self
-            .projection
-            .expect("shade_project_pass called without projection");
-
+    /// World Space In & Out
+    pub fn shade_pass(&self, mut mvs: Array2<MicroVertex>) -> Array2<MicroVertex> {
         // Displacement Shader
         mvs.par_iter_mut()
             .for_each(|mv| mv.displace(self.displace, self.displace_params.clone()));
@@ -134,101 +88,22 @@ impl ModelState {
         Zip::from(mvs.windows((2, 2))).par_map_collect(|mvw| {
             // Recompute Normals
             let mut mv = mvw[(0, 0)].clone();
+            let flip = mv.cnorm.dot(&mv.cpos.coords) < 0.;
             if let Some(cnorm) = UnitVector3::try_new(
                 (mvw[(1, 0)].cpos - mv.cpos).cross(&(mvw[(0, 1)].cpos - mv.cpos)),
-                0.01,
+                f32::EPSILON,
             ) {
                 mv.cnorm = cnorm;
             };
 
             // Surface Shader
-            if mv.cnorm.dot(&mv.cpos.coords) < 0. {
+            if flip {
                 mv.cnorm = -mv.cnorm;
             }
             mv.surface(self.surface, self.surface_params.clone());
 
-            // Projection (cpos is now clip position)
-            mv.cpos = p.transform_point(&mv.cpos);
-            if mv.cpos.x <= -1.
-                || mv.cpos.x > 1.
-                || mv.cpos.y <= -1.
-                || mv.cpos.y > 1.
-                || mv.cpos.z < 0.01
-            {
-                return None;
-            }
-            Some(mv)
+            mv
         })
-    }
-}
-
-/// Everything that needs interpolating
-#[derive(Clone, Copy)]
-pub struct MicroVertex {
-    pub cpos: Point3<f32>,       /* camera space position */
-    pub opos: Point3<f32>,       /* object space position */
-    pub cnorm: UnitVector3<f32>, /* camera space normal */
-    pub uv: (f32, f32),          /* surface parameters in [0,1] */
-    pub color: Vector3<f32>,     /* color */
-    pub alpha: Vector3<f32>,     /* opacity */
-}
-impl Into<shaders::RtShaderContext> for &mut MicroVertex {
-    fn into(self) -> shaders::RtShaderContext {
-        shaders::RtShaderContext {
-            P: self.cpos,
-            Po: self.opos,
-            N: self.cnorm,
-            u: self.uv.0,
-            v: self.uv.1,
-            Cs: self.color,
-            Os: self.alpha,
-            params: std::ptr::null(),
-            Ci: Vector3::zeros(),
-            Oi: Vector3::zeros(),
-        }
-    }
-}
-impl MicroVertex {
-    fn surface(&mut self, shader: shaders::RtShaderFn, params: Option<Arc<[u8]>>) {
-        let mut ctx: shaders::RtShaderContext = self.into();
-        if let Some(params) = params {
-            ctx.params = params.as_ptr() as _;
-        }
-        unsafe { shader.unwrap_or(shaders::STANDARD)(std::ptr::from_mut(&mut ctx)) }
-        self.color = ctx.Ci;
-        self.alpha = ctx.Oi;
-    }
-    fn displace(&mut self, shader: shaders::RtShaderFn, params: Option<Arc<[u8]>>) {
-        let Some(shader) = shader else { return };
-        let mut ctx: shaders::RtShaderContext = self.into();
-        if let Some(params) = params {
-            ctx.params = params.as_ptr() as _;
-        }
-        unsafe { shader(std::ptr::from_mut(&mut ctx)) }
-        self.cpos = ctx.P;
-    }
-}
-
-#[derive(Clone, Copy)] // exclusively so populating the Array2 works
-struct Sample {
-    cdepth: f32,
-    color: Vector3<f32>,
-    alpha: Vector3<f32>,
-}
-impl PartialEq for Sample {
-    fn eq(&self, other: &Self) -> bool {
-        self.cdepth == other.cdepth
-    }
-}
-impl Eq for Sample {}
-impl PartialOrd for Sample {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        other.cdepth.partial_cmp(&self.cdepth)
-    }
-}
-impl Ord for Sample {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.cdepth.total_cmp(&self.cdepth)
     }
 }
 
@@ -239,7 +114,9 @@ pub struct RenderState {
     pub width: usize,
     pub hight: usize,
     pub samples: (usize, usize),
-    sample_buffer: Option<Array2<BinaryHeap<Sample>>>,
+
+    sample_buffer: Option<Array2<SampleBin>>,
+    projection: Option<Projective3<f32>>,
 }
 impl RenderState {
     #[inline]
@@ -251,13 +128,49 @@ impl RenderState {
             display: String::new(),
             depth_display: false,
             sample_buffer: None,
+            projection: None,
         }
     }
 
+    /// Camera Space In, Clip Space Out
+    pub fn project_bounds(&self, cpos: &[Point3<f32>]) -> (Point2<f32>, Point2<f32>) {
+        let proj = self
+            .projection
+            .expect("bounds_clipspace called without projection");
+        RenderState::bounds_2d(cpos.into_iter().map(|cpos| proj.transform_point(cpos).xy()))
+    }
+
+    /// Clip Space In & Out
+    fn bounds_2d(cspos: impl IntoIterator<Item = Point2<f32>>) -> (Point2<f32>, Point2<f32>) {
+        let mut xmin = f32::MAX;
+        let mut xmax = f32::MIN;
+        let mut ymin = f32::MAX;
+        let mut ymax = f32::MIN;
+
+        for cspos in cspos {
+            if xmin > cspos.x {
+                xmin = cspos.x;
+            }
+            if xmax < cspos.x {
+                xmax = cspos.x;
+            }
+            if ymin > cspos.y {
+                ymin = cspos.y;
+            }
+            if ymax < cspos.y {
+                ymax = cspos.y;
+            }
+        }
+
+        (Point2::new(xmin, ymin), Point2::new(xmax, ymax))
+    }
+
+    /// Clip Space In, Viewport Space Out
     #[inline]
-    pub fn diag_pixels_screenspace(&self, ssv: &Vector2<f32>) -> usize {
-        let x = (1. - ssv.y).algebraic_mul((self.hight / 2) as f32);
-        let y = (ssv.x + 1.).algebraic_mul((self.width / 2) as f32);
+    pub fn viewport_bounds_diag(&self, clbounds: (Point2<f32>, Point2<f32>)) -> usize {
+        let cldiag = clbounds.1 - clbounds.0;
+        let x = cldiag.x.algebraic_mul((self.width / 2) as f32);
+        let y = cldiag.y.algebraic_mul((self.hight / 2) as f32);
         f32::algebraic_add(x.algebraic_mul(x), y.algebraic_mul(y))
             .sqrt()
             .ceil() as usize
@@ -265,32 +178,102 @@ impl RenderState {
 
     #[inline]
     pub fn init_sample_buffer(&mut self) {
-        self.sample_buffer = Some(Array2::from_elem(
-            (self.hight * self.samples.0, self.width * self.samples.1),
-            BinaryHeap::new(),
-        ))
+        let shape = (self.hight * self.samples.0, self.width * self.samples.1);
+        let shape_recip = Vector2::new(
+            ((shape.1 / 2) as f32).recip(),
+            ((shape.0 / 2) as f32).recip(),
+        );
+        self.sample_buffer = Some(Array2::from_shape_fn(shape, |_| {
+            SampleBin::new(&shape_recip)
+        }))
     }
 
-    pub fn sample_pass(&mut self, mvs: Array2<Option<MicroVertex>>) {
+    /// Camera Space In
+    pub fn project_sample_pass(&mut self, mut mvs: Array2<MicroVertex>) {
+        // Projection Pass: Output Clip Space
+        let p = self
+            .projection
+            .expect("project_sample_pass called without projection");
+        mvs.par_map_inplace(|mv| mv.cpos = p.transform_point(&mv.cpos));
+
         let sbuf = self
             .sample_buffer
             .as_mut()
-            .expect("RiSphere called before RiWorldBegin");
+            .expect("project_sample_pass called without sample buffer");
         let (hight, width, ..) = sbuf.dim();
+        let (hight, width) = (hight as f32, width as f32);
+        let clip_to_sample = |clpos: &Point2<f32>| -> Point2<usize> {
+            Point2::new(
+                ((clpos.x + 1.) * (width / 2.)).floor() as usize,
+                ((1. - clpos.y) * (hight / 2.)).floor() as usize,
+            )
+        };
+        let sample_to_clip = |ssx: usize, ssy: usize| -> Point2<f32> {
+            Point2::new(
+                (ssx as f32 * 2. / width) - 1.,
+                1. - ((ssy as f32 + 1.) * 2. / hight),
+            )
+        };
 
-        mvs.for_each(|mv| {
-            let Some(mv) = mv else { return };
-            // TODO: change splatting to real sampling
-            sbuf[(
-                (((1. - mv.cpos.y) * (hight / 2) as f32) as usize),
-                (((mv.cpos.x + 1.) * (width / 2) as f32) as usize),
-            )]
-                .push(Sample {
-                    cdepth: mv.cpos.z,
-                    color: mv.color,
-                    alpha: mv.alpha,
-                }); // TODO: discard if after opaque object
+        // Sampling Pass
+        mvs.windows((2, 2)).into_iter().for_each(|mvs| {
+            let (csmin, csmax) = &RenderState::bounds_2d(mvs.flatten().map(|mv| mv.cpos.xy()));
+            let ssmin = clip_to_sample(csmin);
+            let ssmax = clip_to_sample(csmax);
+            let tris = [
+                barycentric_passthrough([&mvs[(0, 0)], &mvs[(1, 0)], &mvs[(1, 1)]]),
+                barycentric_passthrough([&mvs[(0, 0)], &mvs[(0, 1)], &mvs[(1, 1)]]),
+            ];
+
+            for ssx in ssmin.x..=ssmax.x {
+                for ssy in ssmax.y..=ssmin.y {
+                    let Some(sbin) = sbuf.get_mut((ssy, ssx)) else {
+                        continue;
+                    };
+                    let cspos = sample_to_clip(ssx, ssy) + sbin.jitter();
+                    // debug_assert_eq!(
+                    //     // TODO fix incorrect bucketing
+                    //     clip_to_sample(&cspos),
+                    //     Point2::new(ssx, ssy),
+                    //     "{}",
+                    //     sbin.jitter()
+                    // );
+                    for (vs, barym) in tris {
+                        let barys = barym * cspos.to_homogeneous();
+                        if barys.iter().any(|&b| b <= 0. || b >= 1.) {
+                            // outside triangle
+                            // TODO negotiate edges
+                            continue;
+                        }
+                        let mut cdepth = 0.; // TODO fix interpolation
+                        let mut color = Vector3::zeros();
+                        let mut alpha = Vector3::zeros();
+                        for (&b, v) in std::iter::zip(barys.into_iter(), vs) {
+                            cdepth += b * v.cpos.z;
+                            color += b * v.color;
+                            alpha += b * v.alpha;
+                        }
+                        sbin.insert(Sample {
+                            cdepth,
+                            color,
+                            alpha,
+                        });
+                    }
+                }
+            }
         });
+        // mvs.for_each(|mv| {
+        //     if let Some(s) = sbuf.get_mut((
+        //         (((1. - mv.cpos.y) * (hight / 2.)) as usize),
+        //         (((mv.cpos.x + 1.) * (width / 2.)) as usize),
+        //     )) {
+        //         s.insert(Sample {
+        //             cdepth: mv.cpos.z,
+        //             color: mv.color,
+        //             alpha: mv.alpha,
+        //         });
+        //     }
+        // });
     }
 
     /// Consumes the sample buffer and generates a depth image
@@ -319,35 +302,13 @@ impl RenderState {
         let mut fbuf = Array3::<u8>::uninit((self.hight, self.width, 4));
 
         let mut sbuf = self.sample_buffer.take()?;
-        sbuf.par_map_inplace(|s| {
-            if s.is_empty() {
-                return;
-            }
-            let mut opacity = Vector3::zeros();
-            let mut color = Vector3::zeros();
-            while let Some(sample) = s.pop() {
-                color += sample
-                    .color
-                    .component_mul(&sample.alpha)
-                    .component_mul(&(WHITE - opacity));
-                opacity += sample.alpha.component_mul(&(WHITE - opacity));
-                if opacity == WHITE {
-                    s.clear();
-                    break;
-                }
-            }
-            s.push(Sample {
-                cdepth: 0.,
-                color,
-                alpha: opacity,
-            });
-        });
+        sbuf.par_map_inplace(SampleBin::collapse);
         Zip::from(sbuf.exact_chunks_mut(self.samples))
             .and(fbuf.lanes_mut(Axis(2)))
             .par_for_each(|samples, mut lane| {
                 let mut color = Array1::from_elem(4, 0.);
                 for s in samples {
-                    if let Some(s) = s.pop() {
+                    if let Some(s) = s.get_collapsed() {
                         color[0] += s.color.x;
                         color[1] += s.color.y;
                         color[2] += s.color.z;
@@ -355,18 +316,30 @@ impl RenderState {
                     }
                 }
                 color /= (self.samples.0 * self.samples.1) as f32;
-                color[3] /= 3.; // average of 3 opacity colors
+                let alpha = color[3] / 3.; // average of 3 opacity colors
+                if alpha > 0. {
+                    color /= alpha;
+                }
+                color[3] = alpha;
                 lane.assign(
-                    (*color.mapv(|v| MaybeUninit::new((v.clamp(0.0, 1.0) * 255.0).round() as u8)))
-                        .into(),
+                    (*color.mapv(|v| MaybeUninit::new((v.clamp(0.0, 1.0) * 255.5) as u8))).into(),
                 );
             });
 
-        let fbuf = unsafe { fbuf.assume_init() };
-        let (fbuf, off) = fbuf.into_raw_vec_and_offset();
+        let (fbuf, off) = unsafe { fbuf.assume_init() }.into_raw_vec_and_offset();
         debug_assert_matches!(off, Some(0) | None);
         image::RgbaImage::from_raw(self.width as _, self.hight as _, fbuf)
     }
+}
+
+#[inline]
+pub fn set_projection(
+    mstate: &mut ModelState,
+    rstate: &mut RenderState,
+    projection: Projective3<f32>,
+) {
+    rstate.projection = Some(projection);
+    mstate.transform = vec![Projective3::identity()];
 }
 
 /// Write the depth image to renders/<RiDisplay name> in the handout's
@@ -413,4 +386,169 @@ pub fn write_image(rgba: image::RgbaImage, path: &str) -> Result<(), Box<dyn std
             .into());
         }
     })
+}
+
+/// Everything that needs interpolating
+#[derive(Clone)] // for recompute normals, bounding box step
+pub struct MicroVertex {
+    pub cpos: Point3<f32>,       /* camera space position */
+    pub opos: Point3<f32>,       /* object space position */
+    pub cnorm: UnitVector3<f32>, /* camera space normal */
+    pub uv: (f32, f32),          /* surface parameters in [0,1] */
+    pub color: Vector3<f32>,     /* color */
+    pub alpha: Vector3<f32>,     /* opacity */
+}
+impl Into<shaders::RtShaderContext> for &mut MicroVertex {
+    fn into(self) -> shaders::RtShaderContext {
+        shaders::RtShaderContext {
+            P: self.cpos,
+            Po: self.opos,
+            N: self.cnorm,
+            u: self.uv.0,
+            v: self.uv.1,
+            Cs: self.color,
+            Os: self.alpha,
+            params: std::ptr::null(),
+            Ci: Vector3::zeros(),
+            Oi: Vector3::zeros(),
+        }
+    }
+}
+impl MicroVertex {
+    fn surface(&mut self, shader: shaders::RtShaderFn, params: Option<Arc<[u8]>>) {
+        let mut ctx: shaders::RtShaderContext = self.into();
+        if let Some(params) = params {
+            ctx.params = params.as_ptr() as _;
+        }
+        unsafe { shader.unwrap_or(shaders::STANDARD)(std::ptr::from_mut(&mut ctx)) }
+        self.color = ctx.Ci;
+        self.alpha = ctx.Oi;
+    }
+    fn displace(&mut self, shader: shaders::RtShaderFn, params: Option<Arc<[u8]>>) {
+        let Some(shader) = shader else { return };
+        let mut ctx: shaders::RtShaderContext = self.into();
+        if let Some(params) = params {
+            ctx.params = params.as_ptr() as _;
+        }
+        unsafe { shader(std::ptr::from_mut(&mut ctx)) }
+        self.cpos = ctx.P;
+    }
+}
+
+mod sample {
+    use super::*;
+
+    pub struct SampleBin {
+        jitter: Vector2<f32>,
+        samples: Vec<Sample>,
+    }
+    impl SampleBin {
+        /// x [0,sshight), y [0,sswidth)
+        pub fn new(sssize: &Vector2<f32>) -> Self {
+            Self {
+                jitter: Vector2::new_random().component_mul(sssize),
+                samples: Vec::new(),
+            }
+        }
+
+        pub fn jitter(&self) -> &Vector2<f32> {
+            &self.jitter
+        }
+
+        // for depth only... FIXME
+        pub fn pop(&mut self) -> Option<Sample> {
+            self.samples.pop()
+        }
+
+        /// Insert a sample
+        pub fn insert(&mut self, sample: Sample) {
+            for i in 0..self.samples.len() {
+                if sample.cdepth < self.samples[i].cdepth {
+                    if sample.is_opaque() {
+                        self.samples[i] = sample;
+                        self.samples.truncate(i + 1);
+                    } else {
+                        self.samples.insert(i, sample);
+                    }
+                    return;
+                }
+                if self.samples[i].is_opaque() {
+                    return;
+                }
+            }
+            self.samples.push(sample);
+        }
+
+        /// Collapse/sum all samples into one
+        pub fn collapse(&mut self) {
+            if self.samples.is_empty() {
+                return;
+            }
+            let mut opacity = Vector3::zeros();
+            let mut color = Vector3::zeros();
+            for sample in &self.samples {
+                color += sample
+                    .color
+                    .component_mul(&sample.alpha)
+                    .component_mul(&(WHITE - opacity));
+                opacity += sample.alpha.component_mul(&(WHITE - opacity));
+                if opacity == WHITE {
+                    self.samples.clear();
+                    break;
+                }
+            }
+            self.samples.clear();
+            self.samples.push(Sample {
+                cdepth: 0.,
+                color,
+                alpha: opacity,
+            });
+        }
+
+        /// Fetch collapsed value
+        pub fn get_collapsed(&mut self) -> Option<Sample> {
+            debug_assert!(self.samples.len() <= 1);
+            debug_assert_eq!(
+                if let Some(sample) = self.samples.last() {
+                    sample.cdepth
+                } else {
+                    0.
+                },
+                0.
+            );
+            self.samples.pop()
+        }
+    }
+
+    pub struct Sample {
+        pub cdepth: f32,
+        pub color: Vector3<f32>,
+        pub alpha: Vector3<f32>,
+    }
+    impl Sample {
+        pub fn is_opaque(&self) -> bool {
+            self.alpha == WHITE
+        }
+    }
+}
+
+#[inline]
+fn barycentric(vs: [Point2<f32>; 3]) -> Matrix3<f32> {
+    let [a, b, c] = vs;
+    Matrix3::new(
+        b.y - c.y,
+        c.x - b.x,
+        b.x * c.y - c.x * b.y,
+        c.y - a.y,
+        a.x - c.x,
+        c.x * a.y - a.x * c.y,
+        a.y - b.y,
+        b.x - a.x,
+        a.x * b.y - b.x * a.y,
+    ) / (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y))
+}
+
+#[inline]
+fn barycentric_passthrough(vs: [&MicroVertex; 3]) -> ([&MicroVertex; 3], Matrix3<f32>) {
+    (vs, barycentric(vs.map(|v| v.cpos.xy())))
 }
