@@ -28,6 +28,7 @@ void TransparencyTest(void);
 void TransparencyOrder(void);
 void PolygonTest(void);
 void ShadowTest(void);
+void NormalTest(void);
 
 /* 2_IntermediateScenes/ */
 void Rocket(void);
@@ -79,6 +80,7 @@ extern "C" const RtSceneEntry RI_SCENES[] = {
     {"TransparencyOrder", TransparencyOrder, "test"},
     {"PolygonTest", PolygonTest, "test"},
     {"ShadowTest", ShadowTest, "test"},
+    {"NormalTest", NormalTest, "test"},
     /* 2_IntermediateScenes/ */
     {"Rocket", Rocket, "intermediate"},
     {"Explorer", Explorer, "intermediate"},

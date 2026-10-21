@@ -1,8 +1,8 @@
 use crate::shaders;
 use sample::*;
 
+use image::ImageFormat;
 use image::buffer::ConvertBuffer;
-use image::{DynamicImage, ImageFormat};
 use nalgebra::{Matrix3, Point2, Point3, Projective3, UnitVector3, Vector2, Vector3};
 use ndarray::parallel::prelude::{IntoParallelRefMutIterator, ParallelIterator};
 use ndarray::{Array1, Array2, Array3, Axis, Zip};
@@ -15,7 +15,7 @@ const WHITE: Vector3<f32> = Vector3::new(1., 1., 1.);
 
 /// Running state, changes model-to-model
 #[derive(Clone)]
-pub struct ModelState {
+pub struct LocalAttributes {
     pub color: Vector3<f32>,
     pub opacity: Vector3<f32>,
     transform: Vec<Projective3<f32>>,
@@ -23,10 +23,8 @@ pub struct ModelState {
     surface_params: Option<Arc<[u8]>>,
     displace: shaders::RtShaderFn,
     displace_params: Option<Arc<[u8]>>,
-
-    pub textures: [Option<DynamicImage>; 8], // FIXME don't reset this in frame
 }
-impl ModelState {
+impl LocalAttributes {
     #[inline]
     pub const fn default() -> Self {
         Self {
@@ -37,7 +35,6 @@ impl ModelState {
             surface_params: None,
             displace: None,
             displace_params: None,
-            textures: [const { None }; 8],
         }
     }
 
@@ -82,17 +79,21 @@ impl ModelState {
     /// World Space In & Out
     pub fn shade_pass(&self, mut mvs: Array2<MicroVertex>) -> Array2<MicroVertex> {
         // Displacement Shader
-        mvs.par_iter_mut()
-            .for_each(|mv| mv.displace(self.displace, self.displace_params.clone()));
+        if let Some(displace) = self.displace {
+            mvs.par_iter_mut()
+                .for_each(|mv| mv.displace(displace, self.displace_params.clone()));
+        }
 
         Zip::from(mvs.windows((2, 2))).par_map_collect(|mvw| {
             // Recompute Normals
-            let mut mv = mvw[(0, 0)].clone();
-            let flip = mv.cnorm.dot(&mv.cpos.coords) < 0.;
-            if let Some(cnorm) = UnitVector3::try_new(
-                (mvw[(1, 0)].cpos - mv.cpos).cross(&(mvw[(0, 1)].cpos - mv.cpos)),
-                f32::EPSILON,
-            ) {
+            let mut mv = mvw[(0, 0)];
+            let flip = mv.cnorm.dot(&mv.cpos.coords) > 0.;
+            if self.displace.is_some()
+                && let Some(cnorm) = UnitVector3::try_new(
+                    (mvw[(1, 0)].cpos - mv.cpos).cross(&(mvw[(0, 1)].cpos - mv.cpos)),
+                    f32::EPSILON,
+                )
+            {
                 mv.cnorm = cnorm;
             };
 
@@ -107,8 +108,8 @@ impl ModelState {
     }
 }
 
-/// properties of the scene
-pub struct RenderState {
+/// properties of all frames in scene
+pub struct GlobalOptions {
     pub display: String,
     pub depth_display: bool, /* RiDisplay(name, "zfile", "z") */
     pub width: usize,
@@ -118,7 +119,7 @@ pub struct RenderState {
     sample_buffer: Option<Array2<SampleBin>>,
     projection: Option<Projective3<f32>>,
 }
-impl RenderState {
+impl GlobalOptions {
     #[inline]
     pub const fn default() -> Self {
         Self {
@@ -133,19 +134,25 @@ impl RenderState {
     }
 
     /// Camera Space In, Clip Space Out
-    pub fn project_bounds(&self, cpos: &[Point3<f32>]) -> (Point2<f32>, Point2<f32>) {
+    pub fn project_bounds(&self, cpos: &[Point3<f32>]) -> Option<(Point2<f32>, Point2<f32>)> {
         let proj = self
             .projection
             .expect("bounds_clipspace called without projection");
-        RenderState::bounds_2d(cpos.into_iter().map(|cpos| proj.transform_point(cpos).xy()))
+        GlobalOptions::bounds_2d(cpos.into_iter().map(|cpos| proj.transform_point(cpos).xy()))
     }
 
     /// Clip Space In & Out
-    fn bounds_2d(cspos: impl IntoIterator<Item = Point2<f32>>) -> (Point2<f32>, Point2<f32>) {
-        let mut xmin = f32::MAX;
-        let mut xmax = f32::MIN;
-        let mut ymin = f32::MAX;
-        let mut ymax = f32::MIN;
+    fn bounds_2d<T: nalgebra::Scalar + Copy + PartialOrd>(
+        cspos: impl IntoIterator<Item = Point2<T>>,
+    ) -> Option<(Point2<T>, Point2<T>)> {
+        let mut cspos = cspos.into_iter();
+        let Some(first) = cspos.next() else {
+            return None;
+        };
+        let mut xmin = first.x;
+        let mut xmax = first.x;
+        let mut ymin = first.y;
+        let mut ymax = first.y;
 
         for cspos in cspos {
             if xmin > cspos.x {
@@ -162,7 +169,7 @@ impl RenderState {
             }
         }
 
-        (Point2::new(xmin, ymin), Point2::new(xmax, ymax))
+        Some((Point2::new(xmin, ymin), Point2::new(xmax, ymax)))
     }
 
     /// Clip Space In, Viewport Space Out
@@ -180,8 +187,8 @@ impl RenderState {
     pub fn init_sample_buffer(&mut self) {
         let shape = (self.hight * self.samples.0, self.width * self.samples.1);
         let shape_recip = Vector2::new(
-            ((shape.1 / 2) as f32).recip(),
-            ((shape.0 / 2) as f32).recip(),
+            2f32.algebraic_div(shape.1 as _),
+            2f32.algebraic_div(shape.0 as _),
         );
         self.sample_buffer = Some(Array2::from_shape_fn(shape, |_| {
             SampleBin::new(&shape_recip)
@@ -202,99 +209,96 @@ impl RenderState {
             .expect("project_sample_pass called without sample buffer");
         let (hight, width, ..) = sbuf.dim();
         let (hight, width) = (hight as f32, width as f32);
-        let clip_to_sample = |clpos: &Point2<f32>| -> Point2<usize> {
-            Point2::new(
-                ((clpos.x + 1.) * (width / 2.)).floor() as usize,
-                ((1. - clpos.y) * (hight / 2.)).floor() as usize,
-            )
+        let clip_to_sample = |clpos: &Point2<f32>, roundup: bool| -> Point2<usize> {
+            let x = clpos
+                .x
+                .algebraic_add(1.)
+                .algebraic_mul(width.algebraic_div(2.));
+            let y = (-clpos.y)
+                .algebraic_add(1.)
+                .algebraic_mul(hight.algebraic_div(2.));
+            if roundup {
+                Point2::new(x.ceil() as usize, y.floor() as usize)
+            } else {
+                Point2::new(x.floor() as usize, y.ceil() as usize)
+            }
         };
         let sample_to_clip = |ssx: usize, ssy: usize| -> Point2<f32> {
             Point2::new(
-                (ssx as f32 * 2. / width) - 1.,
-                1. - ((ssy as f32 + 1.) * 2. / hight),
+                ((ssx * 2) as f32).algebraic_div(width).algebraic_sub(1.),
+                (-((ssy * 2) as f32)).algebraic_div(hight).algebraic_add(1.),
             )
         };
 
+        #[cfg(not(feature = "splat"))]
         // Sampling Pass
-        mvs.windows((2, 2)).into_iter().for_each(|mvs| {
-            let (csmin, csmax) = &RenderState::bounds_2d(mvs.flatten().map(|mv| mv.cpos.xy()));
-            let ssmin = clip_to_sample(csmin);
-            let ssmax = clip_to_sample(csmax);
-            let tris = [
-                barycentric_passthrough([&mvs[(0, 0)], &mvs[(1, 0)], &mvs[(1, 1)]]),
-                barycentric_passthrough([&mvs[(0, 0)], &mvs[(0, 1)], &mvs[(1, 1)]]),
-            ];
+        mvs.windows((2, 2))
+            .into_iter()
+            .flat_map(|mvs| {
+                std::iter::chain(
+                    barycentric_passthrough([mvs[(0, 0)], mvs[(1, 0)], mvs[(1, 1)]]),
+                    barycentric_passthrough([mvs[(0, 0)], mvs[(0, 1)], mvs[(1, 1)]]),
+                )
+            })
+            .for_each(|(mp, bary)| {
+                let (csmin, csmax) = &GlobalOptions::bounds_2d(mp.map(|mv| mv.cpos.xy())).unwrap();
+                let ssmin = clip_to_sample(csmin, false);
+                let ssmax = clip_to_sample(csmax, true);
 
-            for ssx in ssmin.x..=ssmax.x {
-                for ssy in ssmax.y..=ssmin.y {
-                    let Some(sbin) = sbuf.get_mut((ssy, ssx)) else {
-                        continue;
-                    };
-                    let cspos = sample_to_clip(ssx, ssy) + sbin.jitter();
-                    // debug_assert_eq!(
-                    //     // TODO fix incorrect bucketing
-                    //     clip_to_sample(&cspos),
-                    //     Point2::new(ssx, ssy),
-                    //     "{}",
-                    //     sbin.jitter()
-                    // );
-                    for (vs, barym) in tris {
-                        let barys = barym * cspos.to_homogeneous();
-                        if barys.iter().any(|&b| b <= 0. || b >= 1.) {
+                for ssx in ssmin.x..=ssmax.x {
+                    for ssy in ssmax.y..=ssmin.y {
+                        let Some(sbin) = sbuf.get_mut((ssy, ssx)) else {
+                            continue;
+                        };
+                        let cspos = sample_to_clip(ssx, ssy) + sbin.jitter();
+                        let barys = bary * cspos.to_homogeneous();
+                        if barys.iter().any(|&b| b < 0. || b > 1.) {
                             // outside triangle
                             // TODO negotiate edges
                             continue;
                         }
-                        let mut cdepth = 0.; // TODO fix interpolation
-                        let mut color = Vector3::zeros();
-                        let mut alpha = Vector3::zeros();
-                        for (&b, v) in std::iter::zip(barys.into_iter(), vs) {
-                            cdepth += b * v.cpos.z;
-                            color += b * v.color;
-                            alpha += b * v.alpha;
+                        let cdepth = trilerp(barys, mp.map(|v| v.cpos.z));
+                        if cdepth < 0.01 {
+                            continue;
                         }
                         sbin.insert(Sample {
                             cdepth,
-                            color,
-                            alpha,
+                            color: trilerp(barys, mp.map(|v| v.color)),
+                            alpha: trilerp(barys, mp.map(|v| v.alpha)),
                         });
                     }
                 }
+            });
+        #[cfg(feature = "splat")]
+        // Splatting
+        mvs.for_each(|mv| {
+            let sspos = clip_to_sample(&mv.cpos.xy(), false);
+            if let Some(sbin) = sbuf.get_mut((sspos.y, sspos.x)) {
+                sbin.insert(Sample {
+                    cdepth: mv.cpos.z,
+                    color: mv.color,
+                    alpha: mv.alpha,
+                });
             }
         });
-        // mvs.for_each(|mv| {
-        //     if let Some(s) = sbuf.get_mut((
-        //         (((1. - mv.cpos.y) * (hight / 2.)) as usize),
-        //         (((mv.cpos.x + 1.) * (width / 2.)) as usize),
-        //     )) {
-        //         s.insert(Sample {
-        //             cdepth: mv.cpos.z,
-        //             color: mv.color,
-        //             alpha: mv.alpha,
-        //         });
-        //     }
-        // });
     }
 
     /// Consumes the sample buffer and generates a depth image
     pub fn create_depth(&mut self) -> Option<Array2<f32>> {
+        let mut sbuf = self.sample_buffer.take()?;
+        sbuf.par_map_inplace(SampleBin::collapse_depth);
         Some(
-            Zip::from(self.sample_buffer.take()?.exact_chunks_mut(self.samples)).par_map_collect(
-                |samples| {
-                    let mut minz = f32::MAX;
-                    for s in samples {
-                        while let Some(sample) = s.pop() {
-                            if sample.cdepth >= minz {
-                                break;
-                            }
-                            if sample.alpha.sum() > 0.5 * 3. {
-                                minz = sample.cdepth
-                            }
+            Zip::from(sbuf.exact_chunks_mut(self.samples)).par_map_collect(|samples| {
+                let mut minz = f32::MAX;
+                for s in samples {
+                    if let Some(sample) = s.get_collapsed() {
+                        if sample.cdepth < minz {
+                            minz = sample.cdepth;
                         }
                     }
-                    minz
-                },
-            ),
+                }
+                minz
+            }),
         )
     }
 
@@ -334,12 +338,12 @@ impl RenderState {
 
 #[inline]
 pub fn set_projection(
-    mstate: &mut ModelState,
-    rstate: &mut RenderState,
+    lattr: &mut LocalAttributes,
+    gopts: &mut GlobalOptions,
     projection: Projective3<f32>,
 ) {
-    rstate.projection = Some(projection);
-    mstate.transform = vec![Projective3::identity()];
+    gopts.projection = Some(projection);
+    lattr.transform = vec![Projective3::identity()];
 }
 
 /// Write the depth image to renders/<RiDisplay name> in the handout's
@@ -389,7 +393,7 @@ pub fn write_image(rgba: image::RgbaImage, path: &str) -> Result<(), Box<dyn std
 }
 
 /// Everything that needs interpolating
-#[derive(Clone)] // for recompute normals, bounding box step
+#[derive(Clone, Copy)]
 pub struct MicroVertex {
     pub cpos: Point3<f32>,       /* camera space position */
     pub opos: Point3<f32>,       /* object space position */
@@ -424,8 +428,11 @@ impl MicroVertex {
         self.color = ctx.Ci;
         self.alpha = ctx.Oi;
     }
-    fn displace(&mut self, shader: shaders::RtShaderFn, params: Option<Arc<[u8]>>) {
-        let Some(shader) = shader else { return };
+    fn displace(
+        &mut self,
+        shader: unsafe extern "C" fn(*mut shaders::RtShaderContext),
+        params: Option<Arc<[u8]>>,
+    ) {
         let mut ctx: shaders::RtShaderContext = self.into();
         if let Some(params) = params {
             ctx.params = params.as_ptr() as _;
@@ -455,15 +462,10 @@ mod sample {
             &self.jitter
         }
 
-        // for depth only... FIXME
-        pub fn pop(&mut self) -> Option<Sample> {
-            self.samples.pop()
-        }
-
         /// Insert a sample
         pub fn insert(&mut self, sample: Sample) {
             for i in 0..self.samples.len() {
-                if sample.cdepth < self.samples[i].cdepth {
+                if sample.cdepth <= self.samples[i].cdepth {
                     if sample.is_opaque() {
                         self.samples[i] = sample;
                         self.samples.truncate(i + 1);
@@ -477,6 +479,22 @@ mod sample {
                 }
             }
             self.samples.push(sample);
+        }
+
+        pub fn collapse_depth(&mut self) {
+            for sample in &self.samples {
+                if sample.alpha.sum() > 0.5 * 3. {
+                    let cdepth = sample.cdepth;
+                    self.samples.clear();
+                    self.samples.push(Sample {
+                        cdepth,
+                        color: Vector3::zeros(),
+                        alpha: Vector3::zeros(),
+                    });
+                    return;
+                }
+            }
+            self.samples.clear();
         }
 
         /// Collapse/sum all samples into one
@@ -508,14 +526,12 @@ mod sample {
         /// Fetch collapsed value
         pub fn get_collapsed(&mut self) -> Option<Sample> {
             debug_assert!(self.samples.len() <= 1);
-            debug_assert_eq!(
-                if let Some(sample) = self.samples.last() {
-                    sample.cdepth
-                } else {
-                    0.
-                },
-                0.
-            );
+            debug_assert!(if let Some(sample) = self.samples.last() {
+                sample.cdepth == 0.
+                    || (sample.color == Vector3::zeros() && sample.alpha == Vector3::zeros())
+            } else {
+                true
+            });
             self.samples.pop()
         }
     }
@@ -533,7 +549,7 @@ mod sample {
 }
 
 #[inline]
-fn barycentric(vs: [Point2<f32>; 3]) -> Matrix3<f32> {
+fn barycentric(vs: &[Point2<f32>; 3]) -> Matrix3<f32> {
     let [a, b, c] = vs;
     Matrix3::new(
         b.y - c.y,
@@ -549,6 +565,22 @@ fn barycentric(vs: [Point2<f32>; 3]) -> Matrix3<f32> {
 }
 
 #[inline]
-fn barycentric_passthrough(vs: [&MicroVertex; 3]) -> ([&MicroVertex; 3], Matrix3<f32>) {
-    (vs, barycentric(vs.map(|v| v.cpos.xy())))
+fn barycentric_passthrough(vs: [MicroVertex; 3]) -> Option<([MicroVertex; 3], Matrix3<f32>)> {
+    let clpos = std::array::from_fn(|i| vs[i].cpos.xy());
+    if clpos[0] == clpos[1] || clpos[1] == clpos[2] || clpos[0] == clpos[2] {
+        None // degenerate
+    } else {
+        Some((vs, barycentric(&clpos)))
+    }
+}
+
+#[inline]
+fn trilerp<T: Copy + std::ops::Sub<Output = T> + std::ops::Add<Output = T>>(
+    weights: Vector3<f32>,
+    values: [T; 3],
+) -> T
+where
+    f32: std::ops::Mul<T, Output = T>,
+{
+    values[0] + weights.y * (values[1] - values[0]) + weights.z * (values[2] - values[0])
 }

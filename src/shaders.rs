@@ -217,9 +217,9 @@ pub unsafe extern "C" fn CHECKERBOARD(c: *mut RtShaderContext) {
 /// BUMPY's high octaves need the precision).
 #[unsafe(no_mangle)]
 pub extern "C" fn perlinNoise(mut x: f64, mut y: f64, mut z: f64) -> f64 {
-    let X = (x.floor() as usize) & 255; // FIND UNIT CUBE THAT
-    let Y = (y.floor() as usize) & 255; // CONTAINS POINT.
-    let Z = (z.floor() as usize) & 255;
+    let X = ((x.floor() as i32) & 255) as usize; // FIND UNIT CUBE THAT
+    let Y = ((y.floor() as i32) & 255) as usize; // CONTAINS POINT.
+    let Z = ((z.floor() as i32) & 255) as usize;
     x -= x.floor(); // FIND RELATIVE X,Y,Z
     y -= y.floor(); // OF POINT IN CUBE.
     z -= z.floor();
@@ -349,5 +349,5 @@ pub unsafe extern "C" fn BUMPY(c: *mut RtShaderContext) {
         freq *= 2.0;
     }
 
-    ctx.P += ctx.N.scale((h / scale) as f32 * par.amplitude);
+    ctx.P += ctx.N.scale(((h / scale) * par.amplitude as f64) as f32);
 }
