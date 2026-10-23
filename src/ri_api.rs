@@ -31,9 +31,9 @@ unsafe fn read_token(s: RtToken) -> &'static str {
 }
 
 static DICERATE_MIN: usize = 4;
-static DICERATE_MAX: usize = 2048;
-static HITHER: RtFloat = 0.1;
-static YONDER: RtFloat = 10000.;
+static DICERATE_MAX: usize = 1024;
+static HITHER: RtFloat = 0.5;
+static YONDER: RtFloat = 512.;
 
 static GOPTS: Mutex<GlobalOptions> = Mutex::new(GlobalOptions::default());
 static LATTR: RwLock<LocalAttributes> = RwLock::new(LocalAttributes::default());
@@ -85,9 +85,15 @@ pub extern "C" fn RiPixelSamples(xsamples: RtInt, ysamples: RtInt) {
 /// image instead (Section 4, "Depth output").
 #[unsafe(no_mangle)]
 pub extern "C" fn RiDisplay(name: *const c_char, type_: RtToken, mode: RtToken) {
+    ri_display(unsafe { read_token(name) }.to_string(), unsafe {
+        read_token(type_) == "zfile" || read_token(mode) == "z"
+    });
+}
+
+pub fn ri_display(name: String, depth: bool) {
     let mut gopts = GOPTS.lock().unwrap();
-    gopts.display = unsafe { read_token(name) }.to_string();
-    gopts.depth_display = unsafe { read_token(type_) == "zfile" || read_token(mode) == "z" };
+    gopts.display = name;
+    gopts.depth_display = depth;
 }
 
 /// RiFrameBegin/End bracket one frame of an animation: save the graphics
@@ -110,7 +116,10 @@ pub extern "C" fn RiFrameEnd() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiWorldBegin() {
-    GOPTS.lock().unwrap().init_sample_buffer();
+    let mut gopts = GOPTS.lock().unwrap();
+    let mut lattr = LATTR.write().unwrap();
+    gopts.init_sample_buffer();
+    projection_end(&mut lattr, &mut gopts);
 }
 
 #[unsafe(no_mangle)]
@@ -118,7 +127,7 @@ pub extern "C" fn RiWorldEnd() {
     let mut gopts = GOPTS.lock().unwrap();
     if gopts.depth_display {
         write_depth(
-            &gopts
+            gopts
                 .create_depth()
                 .expect("RiWorldEnd called before RiWorldBegin"),
             &gopts.display,
@@ -145,30 +154,47 @@ pub extern "C" fn RiWorldEnd() {
 #[unsafe(no_mangle)]
 pub extern "C" fn RiProjection(name: RtToken, _token: RtToken, value: RtPointer) {
     let name = unsafe { read_token(name) };
+    ri_projection(
+        name,
+        if value.is_null() {
+            None
+        } else {
+            Some(unsafe { *(value as *const _ as *const RtFloat) }.to_radians())
+        },
+    );
+}
 
+pub fn ri_projection(name: &str, fov: Option<RtFloat>) {
     let mut gopts = GOPTS.lock().unwrap();
     let aspect = (gopts.width as f32) / (gopts.hight as f32);
 
     let mut lattr = LATTR.write().unwrap();
-    set_projection(
+    projection_start(
         &mut lattr,
         &mut gopts,
         match name {
             "perspective" => {
-                let fov = unsafe { *(value as *const _ as *const RtFloat) }.to_radians();
-                let mut persp = Perspective3::new(aspect, fov, HITHER, YONDER).to_projective();
+                let mut persp = Perspective3::new(
+                    aspect,
+                    fov.expect("ri_projection called without fov"),
+                    HITHER,
+                    YONDER,
+                )
+                .to_projective();
                 persp
                     .matrix_mut_unchecked()
                     .prepend_nonuniform_scaling_mut(&RtVector::new(1.0, 1.0, -1.0));
-                persp
+                (persp, nalgebra::Vector4::new(0., 0., 0., 1.))
             }
-            "orthographic" => if aspect >= 1. {
-                Orthographic3::new(-aspect, aspect, -1., 1., YONDER, HITHER)
-            } else {
-                Orthographic3::new(-1., 1., -aspect.recip(), aspect.recip(), YONDER, HITHER)
+            "orthographic" => {
+                let ortho = if aspect >= 1. {
+                    Orthographic3::new(-aspect, aspect, -1., 1., YONDER, HITHER)
+                } else {
+                    Orthographic3::new(-1., 1., -aspect.recip(), aspect.recip(), YONDER, HITHER)
+                };
+                (ortho.to_projective(), ortho.inverse().row(2).transpose())
             }
-            .to_projective(),
-            _ => panic!("RiProjection called with invalid name"),
+            _ => panic!("ri_projection called with invalid name"),
         },
     );
 }
@@ -189,12 +215,16 @@ pub extern "C" fn RiTransformEnd() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiConcatTransform(transform: &[RtFloat; 16]) {
-    let transform = RtMatrix::from_matrix_unchecked(Matrix4::from_row_slice(transform));
+    ri_concattransform(Matrix4::from_column_slice(transform));
+}
+
+pub fn ri_concattransform(transform: Matrix4<RtFloat>) {
     *LATTR
         .write()
         .unwrap()
         .transform_last_mut()
-        .expect("RiConcatTransform called before RiWorldBegin or RtProjection") *= transform;
+        .expect("ri_concattransform called before RiWorldBegin or RtProjection")
+        .matrix_mut_unchecked() *= transform;
 }
 
 #[unsafe(no_mangle)]
@@ -227,7 +257,7 @@ pub extern "C" fn RiScale(sx: RtFloat, sy: RtFloat, sz: RtFloat) {
         .write()
         .unwrap()
         .transform_last_mut()
-        .expect("RiTranslate called before RiWorldBegin or RtProjection")
+        .expect("RiScale called before RiWorldBegin or RtProjection")
         .matrix_mut_unchecked()
         .prepend_nonuniform_scaling_mut(&RtVector::new(sx, sy, sz));
 }
@@ -287,12 +317,14 @@ pub extern "C" fn RiDisplacement(
 /// Load an image into one of 8 texture slots with the image crate
 #[unsafe(no_mangle)]
 pub extern "C" fn RiMakeTexture(file: *const c_char, slot: RtInt) {
-    let path = unsafe { read_token(file) };
+    ri_maketexture(unsafe { read_token(file) }, slot as _)
+}
+
+pub fn ri_maketexture(path: &str, slot: usize) {
     let image = image::open(format!("assets/{}", path))
         .or(image::open(format!("assets/textures/{}", path)))
-        .expect("RiMakeTexture called with invalid file");
-
-    TEXTURES.lock().unwrap()[slot as usize] = Some(image);
+        .expect("ri_maketexture called with invalid file");
+    TEXTURES.lock().unwrap()[slot] = Some(image);
 }
 
 #[inline]
@@ -308,7 +340,7 @@ fn wrap(v: f32) -> f32 {
 /// TOP row (t = 0) to the bottom (Section 6). An empty slot reads black.
 /// result points at three floats.
 #[unsafe(no_mangle)]
-pub extern "C" fn RiTexture(slot: RtInt, s: RtFloat, t: RtFloat, result: &mut RtVector) {
+pub extern "C" fn RiTexture(slot: RtInt, s: RtFloat, t: RtFloat, result: &mut RtColor) {
     let textures = TEXTURES.lock().unwrap();
     let image = textures[slot as usize]
         .as_ref()
@@ -352,32 +384,16 @@ macro_rules! make_corners {
     };
 }
 
-#[inline]
-fn linear_cofactor(m: Matrix4<f32>) -> nalgebra::Matrix3<f32> {
-    nalgebra::Matrix3::new(
-        m[(1, 1)] * m[(2, 2)] - m[(1, 2)] * m[(2, 1)],
-        m[(1, 2)] * m[(2, 0)] - m[(1, 0)] * m[(2, 2)],
-        m[(1, 0)] * m[(2, 1)] - m[(1, 1)] * m[(2, 0)],
-        m[(0, 2)] * m[(2, 1)] - m[(0, 1)] * m[(2, 2)],
-        m[(0, 0)] * m[(2, 2)] - m[(0, 2)] * m[(2, 0)],
-        m[(0, 1)] * m[(2, 0)] - m[(0, 0)] * m[(2, 1)],
-        m[(0, 1)] * m[(1, 2)] - m[(0, 2)] * m[(1, 1)],
-        m[(0, 2)] * m[(1, 0)] - m[(0, 0)] * m[(1, 2)],
-        m[(0, 0)] * m[(1, 1)] - m[(0, 1)] * m[(1, 0)],
-    )
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn RiSphere(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thetamax: RtFloat) {
     let mut gopts = GOPTS.lock().unwrap();
     let lattr = LATTR.read().unwrap();
 
-    let t = lattr
-        .transform_last()
+    let (t, tdual) = lattr
+        .transform_last_cofactor()
         .expect("RiSphere called before RiTransformBegin");
-    let tdual = linear_cofactor(*t.matrix());
 
-    let dicerate = (4 * gopts.viewport_bounds_diag(
+    let dicerate = (2 * gopts.viewport_bounds_diag(
         gopts
             .project_bounds(
                 &make_corners!(radius, radius, zmin, zmax).map(|p| t.transform_point(&p)),
@@ -390,20 +406,20 @@ pub extern "C" fn RiSphere(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thetam
     let phis = (zmin / radius).clamp(-1., 1.).asin();
     let phir = (zmax / radius).clamp(-1., 1.).asin().algebraic_sub(phis);
 
-    let mut mvs = Array2::uninit((dicerate + 2, dicerate + 1));
-    for i in 0..mvs.dim().0 {
-        let u = i as f32 / dicerate as f32;
-        let (sinth, costh) = ther.algebraic_mul(u).sin_cos();
-        for j in 0..mvs.dim().1 {
-            let v = j as f32 / dicerate as f32;
-            let (sinph, cosph) = phis.algebraic_add(phir.algebraic_mul(v)).sin_cos();
+    let mut mvs = Array2::uninit((dicerate + 1, dicerate + 1));
+    for j in 0..mvs.dim().1 {
+        let v = j as f32 / dicerate as f32;
+        let (sinph, cosph) = phis.algebraic_add(phir.algebraic_mul(v)).sin_cos();
+        for i in 0..mvs.dim().0 {
+            let u = i as f32 / dicerate as f32;
+            let (sinth, costh) = ther.algebraic_mul(u).sin_cos();
 
-            let norm = RtVector::new(costh * cosph, sinth * cosph, sinph);
-            let opos = RtPoint::from(norm.scale(radius));
+            let onorm = RtVector::new(costh * cosph, sinth * cosph, sinph);
+            let opos = RtPoint::from(onorm.scale(radius));
             mvs[(i, j)].write(MicroVertex {
-                cpos: t.transform_point(&opos),
+                wpos: t.transform_point(&opos),
                 opos,
-                cnorm: RtNormal::new_normalize(tdual * norm),
+                wnorm: RtNormal::new_normalize(tdual * onorm),
                 uv: (u, v),
                 color: lattr.color,
                 alpha: lattr.opacity,
@@ -411,7 +427,7 @@ pub extern "C" fn RiSphere(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thetam
         }
     }
 
-    gopts.project_sample_pass(lattr.shade_pass(unsafe { mvs.assume_init() }));
+    gopts.project_raster_pass(lattr.shade_pass(unsafe { mvs.assume_init() }));
 }
 
 #[unsafe(no_mangle)]
@@ -419,12 +435,11 @@ pub extern "C" fn RiCylinder(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thet
     let mut gopts = GOPTS.lock().unwrap();
     let lattr = LATTR.read().unwrap();
 
-    let t = lattr
-        .transform_last()
+    let (t, tdual) = lattr
+        .transform_last_cofactor()
         .expect("RiCylinder called before RiTransformBegin");
-    let tdual = linear_cofactor(*t.matrix());
 
-    let dicerate = (4 * gopts.viewport_bounds_diag(
+    let dicerate = (2 * gopts.viewport_bounds_diag(
         gopts
             .project_bounds(
                 &make_corners!(radius, radius, zmin, zmax).map(|p| t.transform_point(&p)),
@@ -435,7 +450,7 @@ pub extern "C" fn RiCylinder(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thet
 
     let ther = thetamax.to_radians();
 
-    let mut mvs = Array2::uninit((dicerate + 2, dicerate + 1));
+    let mut mvs = Array2::uninit((dicerate + 1, dicerate + 1));
     for i in 0..mvs.dim().0 {
         let u = i as f32 / dicerate as f32;
         let (sinth, costh) = ther.algebraic_mul(u).sin_cos();
@@ -445,9 +460,9 @@ pub extern "C" fn RiCylinder(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thet
             let onorm = RtVector::new(costh, sinth, 0.);
             let opos = RtPoint::new(radius * costh, radius * sinth, zmin + v * (zmax - zmin));
             mvs[(i, j)].write(MicroVertex {
-                cpos: t.transform_point(&opos),
+                wpos: t.transform_point(&opos),
                 opos,
-                cnorm: RtNormal::new_normalize(tdual * onorm),
+                wnorm: RtNormal::new_normalize(tdual * onorm),
                 uv: (u, v),
                 color: lattr.color,
                 alpha: lattr.opacity,
@@ -455,7 +470,7 @@ pub extern "C" fn RiCylinder(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thet
         }
     }
 
-    gopts.project_sample_pass(lattr.shade_pass(unsafe { mvs.assume_init() }));
+    gopts.project_raster_pass(lattr.shade_pass(unsafe { mvs.assume_init() }));
 }
 
 #[unsafe(no_mangle)]
@@ -463,12 +478,11 @@ pub extern "C" fn RiCone(height: RtFloat, radius: RtFloat, thetamax: RtFloat) {
     let mut gopts = GOPTS.lock().unwrap();
     let lattr = LATTR.read().unwrap();
 
-    let t = lattr
-        .transform_last()
+    let (t, tdual) = lattr
+        .transform_last_cofactor()
         .expect("RiCone called before RiTransformBegin");
-    let tdual = linear_cofactor(*t.matrix());
 
-    let dicerate = (4 * gopts.viewport_bounds_diag(
+    let dicerate = (2 * gopts.viewport_bounds_diag(
         gopts
             .project_bounds(
                 &make_corners!(radius, radius, height, 0.).map(|p| t.transform_point(&p)),
@@ -479,7 +493,7 @@ pub extern "C" fn RiCone(height: RtFloat, radius: RtFloat, thetamax: RtFloat) {
 
     let ther = thetamax.to_radians();
 
-    let mut mvs = Array2::uninit((dicerate + 2, dicerate + 1));
+    let mut mvs = Array2::uninit((dicerate + 1, dicerate + 1));
     for i in 0..mvs.dim().0 {
         let u = i as f32 / dicerate as f32;
         let (sinth, costh) = ther.algebraic_mul(u).sin_cos();
@@ -490,9 +504,9 @@ pub extern "C" fn RiCone(height: RtFloat, radius: RtFloat, thetamax: RtFloat) {
             let onorm = RtVector::new(height * costh, height * sinth, radius);
             let opos = RtPoint::new(zr * costh, zr * sinth, v * height);
             mvs[(i, j)].write(MicroVertex {
-                cpos: t.transform_point(&opos),
+                wpos: t.transform_point(&opos),
                 opos,
-                cnorm: RtNormal::new_normalize(tdual * onorm),
+                wnorm: RtNormal::new_normalize(tdual * onorm),
                 uv: (u, v),
                 color: lattr.color,
                 alpha: lattr.opacity,
@@ -500,7 +514,7 @@ pub extern "C" fn RiCone(height: RtFloat, radius: RtFloat, thetamax: RtFloat) {
         }
     }
 
-    gopts.project_sample_pass(lattr.shade_pass(unsafe { mvs.assume_init() }));
+    gopts.project_raster_pass(lattr.shade_pass(unsafe { mvs.assume_init() }));
 }
 
 #[unsafe(no_mangle)]
@@ -514,12 +528,11 @@ pub extern "C" fn RiTorus(
     let mut gopts = GOPTS.lock().unwrap();
     let lattr = LATTR.read().unwrap();
 
-    let t = lattr
-        .transform_last()
+    let (t, tdual) = lattr
+        .transform_last_cofactor()
         .expect("RiTorus called before RiTransformBegin");
-    let tdual = linear_cofactor(*t.matrix());
 
-    let dicerate = (4 * gopts.viewport_bounds_diag(
+    let dicerate = (2 * gopts.viewport_bounds_diag(
         gopts
             .project_bounds(
                 &make_corners!(marad + mirad, marad + mirad, -mirad, mirad)
@@ -533,21 +546,21 @@ pub extern "C" fn RiTorus(
     let phis = phimin.to_radians();
     let phir = phimax.to_radians().algebraic_sub(phis);
 
-    let mut mvs = Array2::uninit((dicerate + 2, dicerate + 2));
-    for i in 0..mvs.dim().0 {
-        let u = i as f32 / dicerate as f32;
-        let (sinth, costh) = ther.algebraic_mul(u).sin_cos();
-        for j in 0..mvs.dim().1 {
-            let v = j as f32 / dicerate as f32;
-            let (sinph, cosph) = phis.algebraic_add(phir.algebraic_mul(v)).sin_cos();
-            let r = marad + mirad * cosph;
+    let mut mvs = Array2::uninit((dicerate + 1, dicerate + 1));
+    for j in 0..mvs.dim().1 {
+        let v = j as f32 / dicerate as f32;
+        let (sinph, cosph) = phis.algebraic_add(phir.algebraic_mul(v)).sin_cos();
+        let r = marad + mirad * cosph;
+        for i in 0..mvs.dim().0 {
+            let u = i as f32 / dicerate as f32;
+            let (sinth, costh) = ther.algebraic_mul(u).sin_cos();
 
-            let norm = RtVector::new(cosph * costh, cosph * sinth, sinph);
+            let onorm = RtVector::new(cosph * costh, cosph * sinth, sinph);
             let opos = RtPoint::new(r * costh, r * sinth, mirad * sinph);
             mvs[(i, j)].write(MicroVertex {
-                cpos: t.transform_point(&opos),
+                wpos: t.transform_point(&opos),
                 opos,
-                cnorm: RtNormal::new_normalize(tdual * norm),
+                wnorm: RtNormal::new_normalize(tdual * onorm),
                 uv: (u, v),
                 color: lattr.color,
                 alpha: lattr.opacity,
@@ -555,7 +568,7 @@ pub extern "C" fn RiTorus(
         }
     }
 
-    gopts.project_sample_pass(lattr.shade_pass(unsafe { mvs.assume_init() }));
+    gopts.project_raster_pass(lattr.shade_pass(unsafe { mvs.assume_init() }));
 }
 
 /// A mesh of polygons: polygon i has nverts[i] corners, whose indices into
@@ -573,8 +586,185 @@ pub unsafe extern "C" fn RiPointsPolygons(
     verts: *const RtInt,
     P: *const RtPoint,
     N: *const RtNormal,
-    st: *const RtFloat,
+    st: *const nalgebra::Vector2<RtFloat>,
 ) {
-    let _ = (npolys, nverts, verts, P, N, st);
-    // TODO fill in
+    let nverts = unsafe { std::slice::from_raw_parts(nverts, npolys as usize) };
+    let nverts_total = nverts.iter().sum::<RtInt>() as usize;
+    let idx = unsafe { std::slice::from_raw_parts(verts, nverts_total) };
+    let Some(verts_total) = idx.iter().max().map(|&n| n as usize + 1) else {
+        return;
+    };
+    let P = unsafe { std::slice::from_raw_parts(P, verts_total) };
+    let N = if N.is_null() {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(N, verts_total) })
+    };
+    let st = if st.is_null() {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(st, verts_total) })
+    };
+
+    let mut gopts = GOPTS.lock().unwrap();
+    let lattr = LATTR.read().unwrap();
+
+    let (t, tdual) = lattr
+        .transform_last_cofactor()
+        .expect("RiPointsPolygons called before RiTransformBegin");
+
+    let mut offset = 0;
+    for &nv in nverts {
+        debug_assert!(nv > 2);
+        let nv = nv as usize;
+        let idx = &idx[offset..(offset + nv)];
+        let onorms: Vec<_> = if let Some(N) = N {
+            idx.iter().map(|&v| N[v as usize]).collect()
+        } else {
+            (1..=nv)
+                .map(|idxi| {
+                    RtNormal::new_normalize(RtVector::cross(
+                        &(P[idx[(idxi + 1) % nv] as usize] - P[idx[idxi % nv] as usize]),
+                        &(P[idx[idxi - 1] as usize] - P[idx[idxi % nv] as usize]),
+                    ))
+                })
+                .collect()
+        };
+
+        if nv == 4 {
+            ri_quad(
+                &mut gopts,
+                &lattr,
+                t,
+                &tdual,
+                std::array::from_fn(|vi| P[idx[vi] as usize]),
+                onorms.try_into().unwrap(),
+                st.map(|st| std::array::from_fn(|vi| st[idx[vi] as usize])),
+            );
+        } else {
+            for i in 1..idx.len() - 1 {
+                let tri = [0, i, i + 1];
+                ri_triangle(
+                    &mut gopts,
+                    &lattr,
+                    t,
+                    &tdual,
+                    tri.map(|vi| P[idx[vi] as usize]),
+                    tri.map(|vi| onorms[vi]),
+                    st.map(|st| tri.map(|vi| st[idx[vi] as usize])),
+                );
+            }
+        }
+
+        offset += nv;
+    }
+    debug_assert_eq!(offset, idx.len());
+}
+
+fn ri_triangle(
+    gopts: &mut GlobalOptions,
+    lattr: &LocalAttributes,
+    t: &RtMatrix,
+    tdual: &nalgebra::Matrix3<RtFloat>,
+    opos: [RtPoint; 3],
+    onorm: [RtNormal; 3],
+    uvs: Option<[nalgebra::Vector2<RtFloat>; 3]>,
+) {
+    let dicerate = (2 * gopts.viewport_bounds_diag(
+        gopts
+            .project_bounds(&opos.map(|p| t.transform_point(&p)))
+            .unwrap(),
+    ))
+    .clamp(DICERATE_MIN, DICERATE_MAX);
+
+    let mut mvs = Array2::uninit((dicerate + 1, dicerate + 1));
+    for i in 0..mvs.dim().0 {
+        let u = i as f32 / dicerate as f32;
+        for j in 0..mvs.dim().1 {
+            let v = j as f32 / dicerate as f32;
+            // FUTURE: barycentric dicing
+            // let x = RtVector::new(0., u, v);
+            // let onorm = trilerp(x, onorm);
+            // let opos = RtPoint::from(trilerp(x, opos.map(|opos| opos.coords)));
+            // let uv = uvs.map_or((u, v), |uvs| {
+            //     let uv = trilerp(x, uvs);
+            //     (uv.x, uv.y)
+            // });
+            let onorm = bilerp(u, v, onorm.map(|n| n.into_inner()));
+            let opos = RtPoint::from(bilerp(u, v, opos.map(|p| p.coords)));
+            let uv = uvs.map_or((u, v), |uvs| {
+                let uv = bilerp(u, v, uvs);
+                (uv.x, uv.y)
+            });
+            mvs[(i, j)].write(MicroVertex {
+                wpos: t.transform_point(&opos),
+                opos,
+                wnorm: RtNormal::new_normalize(tdual * onorm),
+                uv,
+                color: lattr.color,
+                alpha: lattr.opacity,
+            });
+        }
+    }
+
+    gopts.project_raster_pass(lattr.shade_pass(unsafe { mvs.assume_init() }));
+
+    #[inline]
+    fn bilerp<T: Copy + std::ops::Add<T, Output = T>>(u: f32, v: f32, values: [T; 3]) -> T
+    where
+        f32: std::ops::Mul<T, Output = T> + std::ops::Mul<f32, Output = f32>,
+    {
+        (1. - v) * ((1. - u) * values[0] + u * values[1]) + v * values[2]
+    }
+}
+
+fn ri_quad(
+    gopts: &mut GlobalOptions,
+    lattr: &LocalAttributes,
+    t: &RtMatrix,
+    tdual: &nalgebra::Matrix3<RtFloat>,
+    opos: [RtPoint; 4],
+    onorm: [RtNormal; 4],
+    uvs: Option<[nalgebra::Vector2<RtFloat>; 4]>,
+) {
+    let dicerate = (2 * gopts.viewport_bounds_diag(
+        gopts
+            .project_bounds(&opos.map(|p| t.transform_point(&p)))
+            .unwrap(),
+    ))
+    .clamp(DICERATE_MIN, DICERATE_MAX);
+
+    let mut mvs = Array2::uninit((dicerate + 1, dicerate + 1));
+    for i in 0..mvs.dim().0 {
+        let u = i as f32 / dicerate as f32;
+        for j in 0..mvs.dim().1 {
+            let v = j as f32 / dicerate as f32;
+
+            let onorm = bilerp(u, v, onorm.map(|n| n.into_inner()));
+            let opos = RtPoint::from(bilerp(u, v, opos.map(|p| p.coords)));
+            let uv = uvs.map_or((u, v), |uvs| {
+                let uv = bilerp(u, v, uvs);
+                (uv.x, uv.y)
+            });
+            mvs[(i, j)].write(MicroVertex {
+                wpos: t.transform_point(&opos),
+                opos,
+                wnorm: RtNormal::new_normalize(tdual * onorm),
+                uv,
+                color: lattr.color,
+                alpha: lattr.opacity,
+            });
+        }
+    }
+
+    gopts.project_raster_pass(lattr.shade_pass(unsafe { mvs.assume_init() }));
+
+    #[inline]
+    fn bilerp<T: Copy + std::ops::Add<T, Output = T>>(u: f32, v: f32, values: [T; 4]) -> T
+    where
+        f32: std::ops::Mul<T, Output = T> + std::ops::Mul<f32, Output = f32>,
+    {
+        (1. - v) * ((1. - u) * values[0] + u * values[1])
+            + v * (u * values[2] + (1. - u) * values[3])
+    }
 }

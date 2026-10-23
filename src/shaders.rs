@@ -332,8 +332,7 @@ pub struct BumpParams {
 /// noise at Po (object space), so the bumps stick to the object as it
 /// moves. The parameters are a BumpParams at c.params.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn BUMPY(c: *mut RtShaderContext) {
-    let ctx = unsafe { &mut *c };
+pub unsafe extern "C" fn BUMPY(ctx: &mut RtShaderContext) {
     let par = unsafe { &*(ctx.params as *const BumpParams) };
 
     let n = par.max_freq_exp - par.min_freq_exp;
@@ -341,7 +340,7 @@ pub unsafe extern "C" fn BUMPY(c: *mut RtShaderContext) {
 
     let mut h = 0.0;
     let mut ampl = 1.0;
-    let mut freq = (1 << par.min_freq_exp as usize) as f64 * ctx.Po.cast();
+    let mut freq = (1u64 << par.min_freq_exp) as f64 * ctx.Po.cast();
 
     for _ in 0..=n {
         h += perlin_noise(freq) * ampl;

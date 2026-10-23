@@ -12,6 +12,7 @@
 //! scenes/0_scene_table.cpp defines (include/scenes.h). The renderer
 //! itself is in ri.rs and shaders.rs.
 
+mod customscene;
 mod internal;
 mod ri_api;
 mod shaders;
@@ -33,7 +34,8 @@ unsafe extern "C" {
     static RI_SCENES: RtSceneEntry;
 }
 
-struct Scene {
+#[derive(Clone)]
+pub struct Scene {
     name: &'static str,
     tier: &'static str,
     function: unsafe extern "C" fn(),
@@ -54,6 +56,7 @@ fn scenes() -> Vec<Scene> {
             entry = entry.add(1);
         }
     }
+    out.push(customscene::SCENE.clone());
     out
 }
 
