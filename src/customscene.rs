@@ -25,11 +25,21 @@ fn function() {
         {
             RiWorldBegin();
             {
+                // Planet
                 RiTransformBegin();
                 {
+                    RiColor(&RtColor::new(0.4, 0., 0.));
                     RiSurface(Some(STANDARD), null(), 0);
-                    RiTranslate(2., -0.5, 4.);
+                    RiTranslate(2., 1., 16.);
                     RiSphere(4., -4., 4., 360.);
+                }
+                RiTransformEnd();
+
+                RiTransformBegin();
+                {
+                    RiColor(&RtColor::from_element(1.));
+                    RiOpacity(&RtColor::new(0.2, 0.2, 0.4));
+                    RiSphere(8., -8., 8., 180.);
                 }
                 RiTransformEnd();
             }

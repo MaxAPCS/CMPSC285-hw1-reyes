@@ -13,7 +13,7 @@ use std::mem::MaybeUninit;
 const BLACK: Vector3<f32> = Vector3::new(0., 0., 0.);
 const WHITE: Vector3<f32> = Vector3::new(1., 1., 1.);
 
-static BARYCENTRIC_BORDER_THRESHOLD: f32 = 1e-4;
+static BARYCENTRIC_BORDER_THRESHOLD: f32 = 1e-6;
 static BARYCENTRIC_DETERMINANT_THRESHOLD: f32 = 1e-12;
 
 /// Running State

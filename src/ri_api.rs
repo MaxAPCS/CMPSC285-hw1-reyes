@@ -242,24 +242,22 @@ pub extern "C" fn RiRotate(angle: RtFloat, dx: RtFloat, dy: RtFloat, dz: RtFloat
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiTranslate(dx: RtFloat, dy: RtFloat, dz: RtFloat) {
-    LATTR
+    *LATTR
         .write()
         .unwrap()
         .transform_last_mut()
         .expect("RiTranslate called before RiWorldBegin or RtProjection")
-        .matrix_mut_unchecked()
-        .prepend_translation_mut(&RtVector::new(dx, dy, dz));
+        .matrix_mut_unchecked() *= Matrix4::new_translation(&RtVector::new(dx, dy, dz));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiScale(sx: RtFloat, sy: RtFloat, sz: RtFloat) {
-    LATTR
+    *LATTR
         .write()
         .unwrap()
         .transform_last_mut()
         .expect("RiScale called before RiWorldBegin or RtProjection")
-        .matrix_mut_unchecked()
-        .prepend_nonuniform_scaling_mut(&RtVector::new(sx, sy, sz));
+        .matrix_mut_unchecked() *= Matrix4::new_nonuniform_scaling(&RtVector::new(sx, sy, sz));
 }
 
 /* ------------------------------------------------------------------ shading */

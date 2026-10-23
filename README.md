@@ -10,7 +10,7 @@ Must be run with assets/ in working directory.
 ```
 reyes                list scenes
 reyes <scene>        one scene, by name
-reyes custom         the custom scene
+reyes CustomScene    the custom scene
 reyes test           every test scene
 reyes intermediate   every intermediate scene
 reyes cinematic      every cinematic scene
