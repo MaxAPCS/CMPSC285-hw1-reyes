@@ -57,7 +57,7 @@ pub unsafe extern "C" fn CONSTANT(c: *mut RtShaderContext) {
 
 /* ------------------------------------------------------------- STANDARD */
 struct StandardLight {
-    /// World-Space Position
+    /// World Space Position
     P: RtPoint,
     /// Color
     C: RtColor,

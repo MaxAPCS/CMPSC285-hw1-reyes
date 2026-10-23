@@ -3,7 +3,7 @@ use sample::*;
 
 use image::{ImageFormat, buffer::ConvertBuffer, error::ParameterError};
 use nalgebra::{
-    Matrix3, Point2, Point3, Projective3, SimdPartialOrd, UnitVector3, Vector2, Vector3, Vector4,
+    Matrix3, Point2, Point3, Projective3, SimdPartialOrd, UnitVector3, Vector2, Vector3,
 };
 use ndarray::{Array2, Array3, ArrayView, Axis, Zip};
 use std::debug_assert_matches;
@@ -95,12 +95,12 @@ impl LocalAttributes {
         self.displace_params = params;
     }
 
-    /// World Space In & Out
+    /// Camera Space In & Out
     pub fn shade_pass(&self, mut mvs: Array2<MicroVertex>) -> Array2<MicroVertex> {
         let mvpos = if let Some(displace) = self.displace {
             // Displacement Shader
             mvs.par_map_inplace(|mv| mv.displace(displace, self.displace_params.as_deref()));
-            Some(mvs.map(|mv| mv.wpos))
+            Some(mvs.map(|mv| mv.cpos))
         } else {
             None
         };
@@ -111,25 +111,25 @@ impl LocalAttributes {
                 && let Some(wnorm) = UnitVector3::try_new(
                     Vector3::cross(
                         &if j == 0 {
-                            mv.wpos - mvpos[(i, j + 1)]
+                            mv.cpos - mvpos[(i, j + 1)]
                         } else {
-                            mvpos[(i, j - 1)] - mv.wpos
+                            mvpos[(i, j - 1)] - mv.cpos
                         },
                         &if i == 0 {
-                            mv.wpos - mvpos[(i + 1, j)]
+                            mv.cpos - mvpos[(i + 1, j)]
                         } else {
-                            mvpos[(i - 1, j)] - mv.wpos
+                            mvpos[(i - 1, j)] - mv.cpos
                         },
                     ),
                     f32::EPSILON,
                 )
             {
-                mv.wnorm = wnorm;
+                mv.cnorm = wnorm;
             }
 
             // Surface Shader
-            if mv.wnorm.dot(&mv.wpos.coords) > 0. {
-                mv.wnorm = -mv.wnorm;
+            if mv.cnorm.dot(&mv.cpos.coords) > 0. {
+                mv.cnorm = -mv.cnorm;
             }
             mv.surface(self.surface, self.surface_params.as_deref());
         });
@@ -150,7 +150,6 @@ pub(crate) struct GlobalOptions {
 
     sample_buffer: Option<Array2<SampleBin>>,
     projection: Option<Projective3<f32>>,
-    proj_inv_z: nalgebra::Vector4<f32>,
 }
 impl GlobalOptions {
     #[inline]
@@ -163,16 +162,15 @@ impl GlobalOptions {
             depth_display: false,
             sample_buffer: None,
             projection: None,
-            proj_inv_z: nalgebra::Vector4::new(0., 0., 0., 0.),
         }
     }
 
-    /// World Space In, Clip Space Out
-    pub fn project_bounds(&self, wpos: &[Point3<f32>]) -> Option<(Point2<f32>, Point2<f32>)> {
+    /// Camera Space In, Clip Space Out
+    pub fn project_bounds(&self, cpos: &[Point3<f32>]) -> Option<(Point2<f32>, Point2<f32>)> {
         let p = self
             .projection
             .expect("project_bounds called without projection");
-        GlobalOptions::bounds_2d(wpos.into_iter().map(|wpos| p.transform_point(wpos).xy()))
+        GlobalOptions::bounds_2d(cpos.into_iter().map(|cpos| p.transform_point(cpos).xy()))
     }
 
     /// Clip Space In & Out
@@ -229,19 +227,20 @@ impl GlobalOptions {
         }))
     }
 
-    /// World Space In
+    /// Camera Space In
     pub fn project_raster_pass(&mut self, mut mvs: Array2<MicroVertex>) {
         // Projection Pass: Output Clip Space
         let p = self
             .projection
             .expect("project_raster_pass called without projection");
         mvs.par_map_inplace(|mv| {
-            let clpos = p.matrix() * mv.wpos.to_homogeneous();
-            mv.wpos = Point3::new(
-                clpos.x / clpos.w,
-                clpos.y / clpos.w,
-                self.proj_inv_z.dot(&clpos),
-            );
+            let cz = mv.cpos.z;
+            if cz < 0.01 {
+                mv.cpos = Point3::new(f32::NAN, f32::NAN, f32::NAN)
+            } else {
+                mv.cpos = p.transform_point(&mv.cpos); // cpos = "clip position"
+                mv.opos = Point3::new(cz, cz, cz); // opos = "original position (z)"
+            }
         });
 
         let sbuf = self
@@ -284,7 +283,7 @@ impl GlobalOptions {
                 )
             })
             .for_each(|(mp, bary)| {
-                let (csmin, csmax) = &GlobalOptions::bounds_2d(mp.map(|mv| mv.wpos.xy())).unwrap();
+                let (csmin, csmax) = &GlobalOptions::bounds_2d(mp.map(|mv| mv.cpos.xy())).unwrap();
                 let ssmin = clip_to_sample(csmin, false);
                 let ssmax = clip_to_sample(csmax, true);
 
@@ -306,12 +305,8 @@ impl GlobalOptions {
                         // TODO negotiate edges
                         return;
                     }
-                    let cdepth = trilerp(barys, mp.map(|v| v.wpos.z));
-                    if cdepth < 0.01 {
-                        return;
-                    }
                     sbin.insert(Sample {
-                        cdepth,
+                        cdepth: trilerp(barys, mp.map(|v| v.opos.z)),
                         color: trilerp(barys, mp.map(|v| v.color)),
                         alpha: trilerp(barys, mp.map(|v| v.alpha)),
                     });
@@ -320,12 +315,12 @@ impl GlobalOptions {
         // Splatting Pass
         #[cfg(feature = "splat")]
         mvs.for_each(|mv| {
-            let sspos = clip_to_sample(&mv.wpos.xy(), false);
+            let sspos = clip_to_sample(&mv.cpos.xy(), false);
             let ssx = sspos.x as usize;
             let ssy = sspos.y as usize;
             if 0 <= sspos.x && ssx < width && 0 <= sspos.y && ssy < hight {
                 sbuf[(ssy, ssx)].insert(Sample {
-                    cdepth: mv.wpos.z,
+                    cdepth: mv.opos.z,
                     color: mv.color,
                     alpha: mv.alpha,
                 });
@@ -381,28 +376,14 @@ impl GlobalOptions {
     }
 }
 
-/// Set a projection as the current transformation
 #[inline]
-pub(crate) fn projection_start(
+pub(crate) fn set_projection(
     lattr: &mut LocalAttributes,
     gopts: &mut GlobalOptions,
-    (projection, proj_inv_z): (Projective3<f32>, Vector4<f32>),
+    projection: Projective3<f32>,
 ) {
-    // debug_assert_eq!(projection.inverse().matrix().row(2).transpose(), proj_inv_z); commented out bcz of rounding errors
-
-    // FIXME ideally camera-world transform should be separate
-    gopts.projection = Some(projection); // None
-    gopts.proj_inv_z = proj_inv_z;
-    lattr.transform = vec![Projective3::identity()]; // vec![projection];
-}
-
-/// Save the current transformation as projection
-#[inline]
-pub(crate) fn projection_end(lattr: &mut LocalAttributes, gopts: &mut GlobalOptions) {
-    // FIXME ideally camera-world transform should be separate
-    // gopts.projection = lattr.transform.pop();
-    // lattr.transform = vec![Projective3::identity()];
-    let _ = (lattr, gopts);
+    gopts.projection = Some(projection);
+    lattr.transform = vec![Projective3::identity()];
 }
 
 /// Write the depth image to renders/<RiDisplay name> in the handout's
@@ -466,8 +447,8 @@ pub(crate) fn write_image(image: image::Rgba32FImage, path: &str) -> Result<(), 
 #[derive(Clone, Copy)]
 pub(crate) struct MicroVertex {
     pub opos: Point3<f32>,       /* object space position */
-    pub wpos: Point3<f32>,       /* world space position */
-    pub wnorm: UnitVector3<f32>, /* world space normal */
+    pub cpos: Point3<f32>,       /* camera space position */
+    pub cnorm: UnitVector3<f32>, /* camera space normal */
     pub uv: (f32, f32),          /* surface parameters in [0,1] */
     pub color: Vector3<f32>,     /* color */
     pub alpha: Vector3<f32>,     /* opacity */
@@ -475,9 +456,9 @@ pub(crate) struct MicroVertex {
 impl Into<shaders::RtShaderContext> for &mut MicroVertex {
     fn into(self) -> shaders::RtShaderContext {
         shaders::RtShaderContext {
-            P: self.wpos,
+            P: self.cpos,
             Po: self.opos,
-            N: self.wnorm,
+            N: self.cnorm,
             u: self.uv.0,
             v: self.uv.1,
             Cs: self.color,
@@ -508,7 +489,7 @@ impl MicroVertex {
             ctx.params = params.as_ptr() as _;
         }
         unsafe { shader(std::ptr::from_mut(&mut ctx)) }
-        self.wpos = ctx.P;
+        self.cpos = ctx.P;
     }
 }
 
@@ -554,7 +535,7 @@ mod sample {
 
         pub fn collapse_depth(&mut self) {
             for sample in &self.samples {
-                if sample.alpha.sum() > 0.5 * 3. {
+                if sample.alpha.sum() >= 0.5 * 3. {
                     let cdepth = sample.cdepth;
                     self.samples.clear();
                     self.samples.push(Sample {
@@ -576,9 +557,6 @@ mod sample {
             let mut opacity = BLACK;
             let mut color = BLACK;
             for sample in &self.samples {
-                if sample.alpha == BLACK {
-                    continue;
-                }
                 color += sample
                     .color
                     .component_mul(&sample.alpha)
@@ -615,6 +593,7 @@ mod sample {
         pub alpha: Vector3<f32>,
     }
     impl Sample {
+        #[inline]
         pub fn is_opaque(&self) -> bool {
             self.alpha == WHITE
         }
@@ -623,7 +602,7 @@ mod sample {
 
 #[inline]
 fn try_barycentric_passthrough(vs: [MicroVertex; 3]) -> Option<([MicroVertex; 3], Matrix3<f32>)> {
-    try_barycentric(&std::array::from_fn(|i| vs[i].wpos.xy())).map(|bary| (vs, bary))
+    try_barycentric(&std::array::from_fn(|i| vs[i].cpos.xy())).map(|bary| (vs, bary))
 }
 
 #[inline]
@@ -633,7 +612,7 @@ fn try_barycentric(vs: &[Point2<f32>; 3]) -> Option<Matrix3<f32>> {
         return None;
     }
     let denom = a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y);
-    if denom.abs() < BARYCENTRIC_DETERMINANT_THRESHOLD {
+    if denom.abs() < BARYCENTRIC_DETERMINANT_THRESHOLD || !denom.is_finite() {
         return None;
     }
     Some(

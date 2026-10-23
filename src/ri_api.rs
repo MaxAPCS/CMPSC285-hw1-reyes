@@ -32,7 +32,7 @@ unsafe fn read_token(s: RtToken) -> &'static str {
 
 static DICERATE_MIN: usize = 4;
 static DICERATE_MAX: usize = 1024;
-static HITHER: RtFloat = 0.5;
+static HITHER: RtFloat = 0.01;
 static YONDER: RtFloat = 512.;
 
 static GOPTS: Mutex<GlobalOptions> = Mutex::new(GlobalOptions::default());
@@ -117,9 +117,7 @@ pub extern "C" fn RiFrameEnd() {
 #[unsafe(no_mangle)]
 pub extern "C" fn RiWorldBegin() {
     let mut gopts = GOPTS.lock().unwrap();
-    let mut lattr = LATTR.write().unwrap();
     gopts.init_sample_buffer();
-    projection_end(&mut lattr, &mut gopts);
 }
 
 #[unsafe(no_mangle)]
@@ -169,7 +167,7 @@ pub fn ri_projection(name: &str, fov: Option<RtFloat>) {
     let aspect = (gopts.width as f32) / (gopts.hight as f32);
 
     let mut lattr = LATTR.write().unwrap();
-    projection_start(
+    set_projection(
         &mut lattr,
         &mut gopts,
         match name {
@@ -184,16 +182,14 @@ pub fn ri_projection(name: &str, fov: Option<RtFloat>) {
                 persp
                     .matrix_mut_unchecked()
                     .prepend_nonuniform_scaling_mut(&RtVector::new(1.0, 1.0, -1.0));
-                (persp, nalgebra::Vector4::new(0., 0., 0., 1.))
+                persp
             }
-            "orthographic" => {
-                let ortho = if aspect >= 1. {
-                    Orthographic3::new(-aspect, aspect, -1., 1., YONDER, HITHER)
-                } else {
-                    Orthographic3::new(-1., 1., -aspect.recip(), aspect.recip(), YONDER, HITHER)
-                };
-                (ortho.to_projective(), ortho.inverse().row(2).transpose())
+            "orthographic" => if aspect >= 1. {
+                Orthographic3::new(-aspect, aspect, -1., 1., YONDER, HITHER)
+            } else {
+                Orthographic3::new(-1., 1., -aspect.recip(), aspect.recip(), YONDER, HITHER)
             }
+            .to_projective(),
             _ => panic!("ri_projection called with invalid name"),
         },
     );
@@ -233,7 +229,7 @@ pub extern "C" fn RiRotate(angle: RtFloat, dx: RtFloat, dy: RtFloat, dz: RtFloat
         .write()
         .unwrap()
         .transform_last_mut()
-        .expect("RiTranslate called before RiTransformBegin")
+        .expect("RiRotate called before RiTransformBegin")
         .matrix_mut_unchecked() *= Matrix4::from_axis_angle(
         &RtNormal::new_normalize(RtVector::new(dx, dy, dz)),
         angle.to_radians(),
@@ -242,22 +238,24 @@ pub extern "C" fn RiRotate(angle: RtFloat, dx: RtFloat, dy: RtFloat, dz: RtFloat
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiTranslate(dx: RtFloat, dy: RtFloat, dz: RtFloat) {
-    *LATTR
+    LATTR
         .write()
         .unwrap()
         .transform_last_mut()
         .expect("RiTranslate called before RiWorldBegin or RtProjection")
-        .matrix_mut_unchecked() *= Matrix4::new_translation(&RtVector::new(dx, dy, dz));
+        .matrix_mut_unchecked()
+        .prepend_translation_mut(&RtVector::new(dx, dy, dz));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiScale(sx: RtFloat, sy: RtFloat, sz: RtFloat) {
-    *LATTR
+    LATTR
         .write()
         .unwrap()
         .transform_last_mut()
         .expect("RiScale called before RiWorldBegin or RtProjection")
-        .matrix_mut_unchecked() *= Matrix4::new_nonuniform_scaling(&RtVector::new(sx, sy, sz));
+        .matrix_mut_unchecked()
+        .prepend_nonuniform_scaling_mut(&RtVector::new(sx, sy, sz));
 }
 
 /* ------------------------------------------------------------------ shading */
@@ -384,6 +382,9 @@ macro_rules! make_corners {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiSphere(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thetamax: RtFloat) {
+    if radius <= 0. {
+        return;
+    }
     let mut gopts = GOPTS.lock().unwrap();
     let lattr = LATTR.read().unwrap();
 
@@ -415,9 +416,9 @@ pub extern "C" fn RiSphere(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thetam
             let onorm = RtVector::new(costh * cosph, sinth * cosph, sinph);
             let opos = RtPoint::from(onorm.scale(radius));
             mvs[(i, j)].write(MicroVertex {
-                wpos: t.transform_point(&opos),
+                cpos: t.transform_point(&opos),
                 opos,
-                wnorm: RtNormal::new_normalize(tdual * onorm),
+                cnorm: RtNormal::new_normalize(tdual * onorm),
                 uv: (u, v),
                 color: lattr.color,
                 alpha: lattr.opacity,
@@ -458,9 +459,9 @@ pub extern "C" fn RiCylinder(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thet
             let onorm = RtVector::new(costh, sinth, 0.);
             let opos = RtPoint::new(radius * costh, radius * sinth, zmin + v * (zmax - zmin));
             mvs[(i, j)].write(MicroVertex {
-                wpos: t.transform_point(&opos),
+                cpos: t.transform_point(&opos),
                 opos,
-                wnorm: RtNormal::new_normalize(tdual * onorm),
+                cnorm: RtNormal::new_normalize(tdual * onorm),
                 uv: (u, v),
                 color: lattr.color,
                 alpha: lattr.opacity,
@@ -473,6 +474,9 @@ pub extern "C" fn RiCylinder(radius: RtFloat, zmin: RtFloat, zmax: RtFloat, thet
 
 #[unsafe(no_mangle)]
 pub extern "C" fn RiCone(height: RtFloat, radius: RtFloat, thetamax: RtFloat) {
+    if height <= 0. {
+        return;
+    }
     let mut gopts = GOPTS.lock().unwrap();
     let lattr = LATTR.read().unwrap();
 
@@ -502,9 +506,9 @@ pub extern "C" fn RiCone(height: RtFloat, radius: RtFloat, thetamax: RtFloat) {
             let onorm = RtVector::new(height * costh, height * sinth, radius);
             let opos = RtPoint::new(zr * costh, zr * sinth, v * height);
             mvs[(i, j)].write(MicroVertex {
-                wpos: t.transform_point(&opos),
+                cpos: t.transform_point(&opos),
                 opos,
-                wnorm: RtNormal::new_normalize(tdual * onorm),
+                cnorm: RtNormal::new_normalize(tdual * onorm),
                 uv: (u, v),
                 color: lattr.color,
                 alpha: lattr.opacity,
@@ -556,9 +560,9 @@ pub extern "C" fn RiTorus(
             let onorm = RtVector::new(cosph * costh, cosph * sinth, sinph);
             let opos = RtPoint::new(r * costh, r * sinth, mirad * sinph);
             mvs[(i, j)].write(MicroVertex {
-                wpos: t.transform_point(&opos),
+                cpos: t.transform_point(&opos),
                 opos,
-                wnorm: RtNormal::new_normalize(tdual * onorm),
+                cnorm: RtNormal::new_normalize(tdual * onorm),
                 uv: (u, v),
                 color: lattr.color,
                 alpha: lattr.opacity,
@@ -619,11 +623,11 @@ pub unsafe extern "C" fn RiPointsPolygons(
         let onorms: Vec<_> = if let Some(N) = N {
             idx.iter().map(|&v| N[v as usize]).collect()
         } else {
-            (1..=nv)
+            (0..nv)
                 .map(|idxi| {
                     RtNormal::new_normalize(RtVector::cross(
-                        &(P[idx[(idxi + 1) % nv] as usize] - P[idx[idxi % nv] as usize]),
-                        &(P[idx[idxi - 1] as usize] - P[idx[idxi % nv] as usize]),
+                        &(P[idx[(idxi + 1) % nv] as usize] - P[idx[idxi] as usize]),
+                        &(P[idx[(idxi + nv - 1) % nv] as usize] - P[idx[idxi] as usize]),
                     ))
                 })
                 .collect()
@@ -695,9 +699,9 @@ fn ri_triangle(
                 (uv.x, uv.y)
             });
             mvs[(i, j)].write(MicroVertex {
-                wpos: t.transform_point(&opos),
+                cpos: t.transform_point(&opos),
                 opos,
-                wnorm: RtNormal::new_normalize(tdual * onorm),
+                cnorm: RtNormal::new_normalize(tdual * onorm),
                 uv,
                 color: lattr.color,
                 alpha: lattr.opacity,
@@ -745,9 +749,9 @@ fn ri_quad(
                 (uv.x, uv.y)
             });
             mvs[(i, j)].write(MicroVertex {
-                wpos: t.transform_point(&opos),
+                cpos: t.transform_point(&opos),
                 opos,
-                wnorm: RtNormal::new_normalize(tdual * onorm),
+                cnorm: RtNormal::new_normalize(tdual * onorm),
                 uv,
                 color: lattr.color,
                 alpha: lattr.opacity,
