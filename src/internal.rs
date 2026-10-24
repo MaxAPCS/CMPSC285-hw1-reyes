@@ -174,6 +174,7 @@ impl GlobalOptions {
     }
 
     /// Clip Space In & Out
+    #[inline]
     fn bounds_2d<T: nalgebra::Scalar + Copy + PartialOrd>(
         cspos: impl IntoIterator<Item = Point2<T>>,
     ) -> Option<(Point2<T>, Point2<T>)> {

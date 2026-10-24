@@ -1,0 +1,10 @@
+{
+  "emeraldwalk.runonsave": {
+    "autoClearConsole": true,
+    "commands": [{
+      "cmd": "cargo run -- CustomScene",
+      "match": "src\/customscene\\.rs$",
+      "autoShowOutputPanel": "error"
+    }],
+  }
+}

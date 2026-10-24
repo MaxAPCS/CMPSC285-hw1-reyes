@@ -15,7 +15,7 @@
 
 #![allow(non_snake_case)] // the shader names are the handout's
 
-use crate::ri_api::{RtColor, RtFloat, RtInt, RtNormal, RtPoint};
+use crate::ri_api::{RiTexture, RtColor, RtFloat, RtInt, RtNormal, RtPoint};
 use std::ffi::c_void;
 
 /// What a shader sees at one grid vertex (Ri.h's RtShaderContext, same
@@ -56,13 +56,13 @@ pub unsafe extern "C" fn CONSTANT(c: *mut RtShaderContext) {
 }
 
 /* ------------------------------------------------------------- STANDARD */
-struct StandardLight {
+pub struct StandardLight {
     /// World Space Position
-    P: RtPoint,
+    pub P: RtPoint,
     /// Color
-    C: RtColor,
+    pub C: RtColor,
     /// Intensity
-    I: RtFloat,
+    pub I: RtFloat,
 }
 
 const DEFAULTLIGHTS: [StandardLight; 3] = [
@@ -83,12 +83,12 @@ const DEFAULTLIGHTS: [StandardLight; 3] = [
     },
 ];
 
-struct StandardParams<'a> {
-    ka: f32,
-    kd: f32,
-    ks: f32,
-    spec_exp: usize,
-    lights: &'a [StandardLight],
+pub struct StandardParams<'a> {
+    pub ka: f32,
+    pub kd: f32,
+    pub ks: f32,
+    pub spec_exp: usize,
+    pub lights: &'a [StandardLight],
 }
 
 impl StandardParams<'_> {
@@ -103,8 +103,6 @@ impl StandardParams<'_> {
     }
 }
 
-const DEFAULTSTANDARD: StandardParams<'static> = StandardParams::default();
-
 /// Ambient, plus Lambertian diffuse, plus Phong specular, with the three
 /// lights and the coefficients given in the handout (Section 5):
 ///   Ci = Cs (ka + kd sum max(N.L, 0) I C) + ks sum max(R.V, 0)^32 I C
@@ -116,7 +114,11 @@ const DEFAULTSTANDARD: StandardParams<'static> = StandardParams::default();
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn STANDARD(c: *mut RtShaderContext) {
     let ctx = unsafe { &mut *c };
-    let par = &DEFAULTSTANDARD;
+    let par = if ctx.params.is_null() {
+        &StandardParams::default()
+    } else {
+        unsafe { &*(ctx.params as *const StandardParams) }
+    };
 
     let mut diffuse = RtColor::zeros();
     let mut specular = RtColor::zeros();
@@ -135,6 +137,30 @@ pub unsafe extern "C" fn STANDARD(c: *mut RtShaderContext) {
     ctx.Ci = (par.ka * const { RtColor::new(1., 1., 1.) } + par.kd * diffuse + par.ks * specular)
         .component_mul(&ctx.Cs);
     ctx.Oi = ctx.Os;
+}
+
+pub struct TexturedStandardParams<'a> {
+    texture: u8,
+    params: &'a StandardParams<'a>,
+}
+impl<'a> TexturedStandardParams<'a> {
+    pub fn new(texture: u8, params: &'a StandardParams<'a>) -> Self {
+        Self { texture, params }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TEXSTANDARD(c: *mut RtShaderContext) {
+    let ctx = unsafe { &mut *c };
+    let par = if ctx.params.is_null() {
+        return;
+    } else {
+        unsafe { &*(ctx.params as *const TexturedStandardParams) }
+    };
+
+    RiTexture(par.texture as _, ctx.u, ctx.v, &mut ctx.Cs);
+    ctx.params = par.params as *const _ as *const _;
+    unsafe { STANDARD(ctx) };
 }
 
 /* --------------------------------------------------------- CHECKERBOARD */
@@ -177,8 +203,8 @@ pub struct CheckerParams {
 ///         c.params = p as *const CheckerParams as *const c_void;  (put back for whoever called CHECKERBOARD)
 ///     }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn CHECKERBOARD(c: *mut RtShaderContext) {
-    let ctx = unsafe { &mut *c };
+pub unsafe extern "C" fn CHECKERBOARD(ctx: *mut RtShaderContext) {
+    let ctx = unsafe { &mut *ctx };
     let par = unsafe { &*(ctx.params as *const CheckerParams) };
 
     if ((ctx.u * (par.sizex as f32)).floor() as isize % 2)
@@ -332,7 +358,8 @@ pub struct BumpParams {
 /// noise at Po (object space), so the bumps stick to the object as it
 /// moves. The parameters are a BumpParams at c.params.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn BUMPY(ctx: &mut RtShaderContext) {
+pub unsafe extern "C" fn BUMPY(ctx: *mut RtShaderContext) {
+    let ctx = unsafe { &mut *ctx };
     let par = unsafe { &*(ctx.params as *const BumpParams) };
 
     let n = par.max_freq_exp - par.min_freq_exp;
@@ -349,4 +376,17 @@ pub unsafe extern "C" fn BUMPY(ctx: &mut RtShaderContext) {
     }
 
     ctx.P += ctx.N.scale(((h / scale) * par.amplitude as f64) as f32);
+}
+
+pub struct ScatterParams {
+    pub threshold: RtFloat,
+}
+
+pub unsafe extern "C" fn SCATTER(ctx: *mut RtShaderContext) {
+    let ctx = unsafe { &mut *ctx };
+    let par = unsafe { &*(ctx.params as *const ScatterParams) };
+
+    if perlin_noise(ctx.Po.cast()) < par.threshold as _ {
+        ctx.Oi = RtColor::zeros()
+    }
 }

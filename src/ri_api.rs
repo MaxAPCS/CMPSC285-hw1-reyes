@@ -596,18 +596,30 @@ pub unsafe extern "C" fn RiPointsPolygons(
     let Some(verts_total) = idx.iter().max().map(|&n| n as usize + 1) else {
         return;
     };
-    let P = unsafe { std::slice::from_raw_parts(P, verts_total) };
-    let N = if N.is_null() {
-        None
-    } else {
-        Some(unsafe { std::slice::from_raw_parts(N, verts_total) })
-    };
-    let st = if st.is_null() {
-        None
-    } else {
-        Some(unsafe { std::slice::from_raw_parts(st, verts_total) })
-    };
+    ri_pointspolygons(
+        nverts,
+        idx,
+        unsafe { std::slice::from_raw_parts(P, verts_total) },
+        if N.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(N, verts_total) })
+        },
+        if st.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(st, verts_total) })
+        },
+    )
+}
 
+pub fn ri_pointspolygons(
+    poly_vert_cts: &[i32],
+    verts: &[i32],
+    P: &[RtPoint],
+    N: Option<&[RtNormal]>,
+    st: Option<&[nalgebra::Vector2<RtFloat>]>,
+) {
     let mut gopts = GOPTS.lock().unwrap();
     let lattr = LATTR.read().unwrap();
 
@@ -616,34 +628,35 @@ pub unsafe extern "C" fn RiPointsPolygons(
         .expect("RiPointsPolygons called before RiTransformBegin");
 
     let mut offset = 0;
-    for &nv in nverts {
+    for &nv in poly_vert_cts {
         debug_assert!(nv > 2);
         let nv = nv as usize;
-        let idx = &idx[offset..(offset + nv)];
-        let onorms: Vec<_> = if let Some(N) = N {
-            idx.iter().map(|&v| N[v as usize]).collect()
-        } else {
-            (0..nv)
-                .map(|idxi| {
-                    RtNormal::new_normalize(RtVector::cross(
-                        &(P[idx[(idxi + 1) % nv] as usize] - P[idx[idxi] as usize]),
-                        &(P[idx[(idxi + nv - 1) % nv] as usize] - P[idx[idxi] as usize]),
-                    ))
-                })
-                .collect()
-        };
+        let idx = &verts[offset..(offset + nv)];
 
         if nv == 4 {
-            ri_quad(
+            ri_quad_int(
                 &mut gopts,
                 &lattr,
                 t,
                 &tdual,
                 std::array::from_fn(|vi| P[idx[vi] as usize]),
-                onorms.try_into().unwrap(),
+                N.map(|N| std::array::from_fn(|vi| N[idx[vi] as usize])),
                 st.map(|st| std::array::from_fn(|vi| st[idx[vi] as usize])),
             );
         } else {
+            let onorms: Vec<_> = if let Some(N) = N {
+                idx.iter().map(|&v| N[v as usize]).collect()
+            } else {
+                (0..nv)
+                    .map(|idxi| {
+                        RtNormal::new_normalize(RtVector::cross(
+                            &(P[idx[(idxi + 1) % nv] as usize] - P[idx[idxi] as usize]),
+                            &(P[idx[(idxi + nv - 1) % nv] as usize] - P[idx[idxi] as usize]),
+                        ))
+                    })
+                    .collect()
+            };
+
             for i in 1..idx.len() - 1 {
                 let tri = [0, i, i + 1];
                 ri_triangle(
@@ -660,7 +673,7 @@ pub unsafe extern "C" fn RiPointsPolygons(
 
         offset += nv;
     }
-    debug_assert_eq!(offset, idx.len());
+    debug_assert_eq!(offset, verts.len());
 }
 
 fn ri_triangle(
@@ -720,13 +733,28 @@ fn ri_triangle(
     }
 }
 
-fn ri_quad(
+pub fn ri_quad(
+    opos: [RtPoint; 4],
+    onorm: Option<[RtNormal; 4]>,
+    uvs: Option<[nalgebra::Vector2<RtFloat>; 4]>,
+) {
+    let mut gopts = GOPTS.lock().unwrap();
+    let lattr = LATTR.read().unwrap();
+
+    let (t, tdual) = lattr
+        .transform_last_cofactor()
+        .expect("RiPointsPolygons called before RiTransformBegin");
+
+    ri_quad_int(&mut gopts, &lattr, t, &tdual, opos, onorm, uvs);
+}
+
+fn ri_quad_int(
     gopts: &mut GlobalOptions,
     lattr: &LocalAttributes,
     t: &RtMatrix,
     tdual: &nalgebra::Matrix3<RtFloat>,
     opos: [RtPoint; 4],
-    onorm: [RtNormal; 4],
+    onorm: Option<[RtNormal; 4]>,
     uvs: Option<[nalgebra::Vector2<RtFloat>; 4]>,
 ) {
     let dicerate = (2 * gopts.viewport_bounds_diag(
@@ -735,6 +763,15 @@ fn ri_quad(
             .unwrap(),
     ))
     .clamp(DICERATE_MIN, DICERATE_MAX);
+
+    let onorm = onorm.unwrap_or_else(|| {
+        std::array::from_fn(|idxi| {
+            RtNormal::new_normalize(RtVector::cross(
+                &(opos[(idxi + 1) % 4] - opos[idxi]),
+                &(opos[(idxi + 3) % 4] - opos[idxi]),
+            ))
+        })
+    });
 
     let mut mvs = Array2::uninit((dicerate + 1, dicerate + 1));
     for i in 0..mvs.dim().0 {

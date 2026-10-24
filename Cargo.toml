@@ -13,6 +13,7 @@ nalgebra = { version = "0.35", default-features = false, features = ["std", "ran
 [build-dependencies]
 # build.rs compiles the C++ scene files with it.
 cc = "1"
+bindgen = "0.73"
 
 [profile.dev]
 opt-level = 1

@@ -8,7 +8,10 @@
 //! this binary. A scene of your own is a new .cpp anywhere in scenes/ (picked
 //! up here automatically) and one line in scenes/0_scene_table.cpp.
 
-use std::path::{Path, PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -18,7 +21,7 @@ fn main() {
 
     // Every .cpp in scenes/ (the scene table and the test scenes) and in the
     // two bigger tiers.
-    let mut files: Vec<PathBuf> = Vec::new();
+    let mut files = Vec::new();
     for tier in ["", "2_IntermediateScenes", "3_CinematicScenes"] {
         let folder = scenes.join(tier);
         let mut found: Vec<PathBuf> = std::fs::read_dir(&folder)
@@ -38,11 +41,41 @@ fn main() {
     cc::Build::new()
         .cpp(true)
         .std("c++17")
-        .include(include)
+        .include(&include)
         .files(&files)
+        .flag("--keep-inline-functions")
         // The scene files are not ours to fix, so their warnings are off
         // (CheckerParams cp = { 8, 4 }; leaves fields zero on purpose).
         .warnings(false)
         .define("_CRT_SECURE_NO_WARNINGS", None) // MSVC: fopen and snprintf are fine
         .compile("scenes");
+
+    let headers = std::fs::read_dir(&include)
+        .expect("cannot read include dir")
+        .filter_map(|e| {
+            e.ok().and_then(|e| {
+                let path = e.path();
+                if path.extension().is_some_and(|ext| ext == "h") {
+                    Some(path.into_string().expect("cannot read file path"))
+                } else {
+                    None
+                }
+            })
+        });
+
+    let bindings = bindgen::Builder::default()
+        .clang_args(["-x", "c++", "-std=c++17"])
+        .headers(headers)
+        .generate_inline_functions(true)
+        .allowlist_function(r"obj_\w+")
+        .allowlist_function(r"Buzz\w+")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .generate()
+        .expect("Unable to generate bindings");
+
+    // Write the bindings to the $OUT_DIR/bindings.rs file.
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    bindings
+        .write_to_file(out_path.join("bindings.rs"))
+        .expect("Couldn't write bindings!");
 }
